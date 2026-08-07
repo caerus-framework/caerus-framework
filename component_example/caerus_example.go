@@ -7,9 +7,9 @@ import (
 )
 
 // ApplicationStage is the application-owned stage this component initializes
-// in. Stages are developer-defined: register them with fw.RegisterStage in the
-// order they should run (after the framework-owned bootstrap prefix), then
-// return the stage name from GetInitOrderStage.
+// in. Stages are developer-defined: AddComponent registers the stage
+// automatically the first time a component returns it from GetInitOrderStage,
+// after the framework-owned bootstrap prefix.
 const ApplicationStage = caerusframework.Stage("application")
 
 // CaerusExample demonstrates a minimal component. Extend the struct with

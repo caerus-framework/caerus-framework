@@ -25,17 +25,11 @@ const (
 	testServeStage    = Stage("serve")
 )
 
-// newTestFW returns a framework with the custom test stages registered, in
-// order, after the built-in bootstrap stages (logs, configuration,
-// observability, secrets).
+// newTestFW returns a bare framework. Custom stages are auto-registered by
+// AddComponent in first-seen order, so tests that mix stages add their
+// components in stage order.
 func newTestFW() *CaerusFramework {
-	fw := New()
-	for _, s := range []Stage{testDataStage, testBusinessStage, testServeStage} {
-		if err := fw.RegisterStage(s); err != nil {
-			panic(err)
-		}
-	}
-	return fw
+	return New()
 }
 
 func newFake(name string, stage Stage, deps ...string) *fake {
@@ -86,19 +80,6 @@ func (h *healthy) Health(ctx context.Context) error {
 	return nil
 }
 
-// metricsComp embeds *fake and additionally implements MetricsProvider.
-type metricsComp struct {
-	*fake
-	ready bool
-}
-
-func (m *metricsComp) Metrics() []Metric {
-	if !m.ready {
-		return nil
-	}
-	return []Metric{{Name: "fake_info", Value: 1}}
-}
-
 func mustAdd(t *testing.T, fw *CaerusFramework, c CaerusComponent) {
 	t.Helper()
 	if err := fw.AddComponent(c); err != nil {
@@ -116,9 +97,9 @@ func names(components []CaerusComponent) []string {
 
 func TestDependencyOrder(t *testing.T) {
 	fw := newTestFW()
-	mustAdd(t, fw, newFake("a", testBusinessStage, "b", "c"))
 	mustAdd(t, fw, newFake("b", testDataStage, "c"))
 	mustAdd(t, fw, newFake("c", testDataStage))
+	mustAdd(t, fw, newFake("a", testBusinessStage, "b", "c"))
 
 	order, err := fw.Validate()
 	if err != nil {
@@ -131,9 +112,9 @@ func TestDependencyOrder(t *testing.T) {
 
 func TestBucketTieBreak(t *testing.T) {
 	fw := newTestFW()
-	mustAdd(t, fw, newFake("web", testServeStage))
 	mustAdd(t, fw, newFake("db", testDataStage))
 	mustAdd(t, fw, newFake("cache", testDataStage))
+	mustAdd(t, fw, newFake("web", testServeStage))
 
 	order, err := fw.Validate()
 	if err != nil {
@@ -214,8 +195,8 @@ func TestSelfDependencyCycle(t *testing.T) {
 
 func TestValidateDeterministicAndCached(t *testing.T) {
 	fw := newTestFW()
-	mustAdd(t, fw, newFake("a", testBusinessStage, "b"))
 	mustAdd(t, fw, newFake("b", testDataStage))
+	mustAdd(t, fw, newFake("a", testBusinessStage, "b"))
 
 	first, err := fw.Validate()
 	if err != nil {
@@ -327,8 +308,8 @@ func TestShutdownReverseOrder(t *testing.T) {
 		return nil
 	}
 
-	mustAdd(t, fw, a)
 	mustAdd(t, fw, b)
+	mustAdd(t, fw, a)
 
 	if err := fw.Run(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
@@ -472,6 +453,72 @@ func TestAddComponentValidation(t *testing.T) {
 	}
 	if err := fw.AddComponent(c); err == nil {
 		t.Fatal("expected error for duplicate name")
+	}
+	badStage := newFake("badstage", "")
+	if err := fw.AddComponent(badStage); err == nil {
+		t.Fatal("expected error for empty stage")
+	}
+}
+
+// composite embeds *fake and returns children from Subcomponents.
+type composite struct {
+	*fake
+	children []CaerusComponent
+}
+
+func (c *composite) Subcomponents() []CaerusComponent { return c.children }
+
+func TestAddComponentExpandsSubcomponentsBFS(t *testing.T) {
+	fw := newTestFW()
+	grandchild := newFake("grandchild", testDataStage)
+	childA := &composite{fake: newFake("child-a", testDataStage), children: []CaerusComponent{grandchild}}
+	childB := newFake("child-b", testDataStage)
+	parent := &composite{
+		fake:     newFake("parent", testBusinessStage),
+		children: []CaerusComponent{childA, childB},
+	}
+	if err := fw.AddComponent(parent); err != nil {
+		t.Fatalf("AddComponent: %v", err)
+	}
+	// BFS registration order: parent, child-a, child-b, grandchild
+	want := []string{"parent", "child-a", "child-b", "grandchild"}
+	var got []string
+	for _, c := range fw.components {
+		got = append(got, c.Name())
+	}
+	if len(got) != len(want) {
+		t.Fatalf("registered = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("registered[%d] = %q, want %q (full %v)", i, got[i], want[i], got)
+		}
+	}
+	if _, ok := fw.Component("grandchild"); !ok {
+		t.Fatal("grandchild missing from registry")
+	}
+}
+
+func TestAddComponentSubcomponentsNilChild(t *testing.T) {
+	fw := newTestFW()
+	parent := &composite{
+		fake:     newFake("parent", testDataStage),
+		children: []CaerusComponent{newFake("ok", testDataStage), nil},
+	}
+	if err := fw.AddComponent(parent); err == nil {
+		t.Fatal("expected error for nil Subcomponents entry")
+	}
+}
+
+func TestAddComponentSubcomponentsDuplicateName(t *testing.T) {
+	fw := newTestFW()
+	dup := newFake("dup", testDataStage)
+	parent := &composite{
+		fake:     newFake("parent", testDataStage),
+		children: []CaerusComponent{dup, newFake("dup", testDataStage)},
+	}
+	if err := fw.AddComponent(parent); err == nil {
+		t.Fatal("expected error for duplicate child name")
 	}
 }
 
@@ -629,35 +676,6 @@ func TestComponentsSnapshotAndHealthProviderDiscovery(t *testing.T) {
 	}
 }
 
-func TestComponentsSnapshotAndMetricsProviderDiscovery(t *testing.T) {
-	fw := newTestFW()
-	db := newFake("db", testDataStage)
-	mb := &metricsComp{fake: newFake("metrics", testDataStage), ready: true}
-	mlazy := &metricsComp{fake: newFake("lazy", testDataStage)}
-	mustAdd(t, fw, db)
-	mustAdd(t, fw, mb)
-	mustAdd(t, fw, mlazy)
-
-	// MetricsProvider discovery: only components implementing it are found.
-	providers := make(map[string]MetricsProvider)
-	for _, c := range fw.Components() {
-		if mp, ok := c.(MetricsProvider); ok {
-			providers[c.Name()] = mp
-		}
-	}
-	if _, ok := providers["db"]; ok {
-		t.Fatal("db does not implement MetricsProvider and must not be discovered")
-	}
-	if _, ok := providers["metrics"]; !ok {
-		t.Fatal("metrics implements MetricsProvider and must be discovered")
-	}
-	if mp := providers["lazy"]; mp == nil {
-		t.Fatal("lazy implements MetricsProvider and must be discovered")
-	} else if mp.Metrics() != nil {
-		t.Fatal("lazy is not ready and must report no metrics yet")
-	}
-}
-
 func TestForwardStageDependencyRejected(t *testing.T) {
 	fw := newTestFW()
 	mustAdd(t, fw, newFake("core", LogsStage, "db"))
@@ -702,9 +720,9 @@ func TestBootstrapIntraStageDependency(t *testing.T) {
 
 func TestSameStageDependencyWithinStage(t *testing.T) {
 	fw := newTestFW()
-	mustAdd(t, fw, newFake("app", testBusinessStage, "app2"))
-	mustAdd(t, fw, newFake("app2", testBusinessStage, "db"))
 	mustAdd(t, fw, newFake("db", testDataStage))
+	mustAdd(t, fw, newFake("app2", testBusinessStage, "db"))
+	mustAdd(t, fw, newFake("app", testBusinessStage, "app2"))
 
 	order, err := fw.Validate()
 	if err != nil {
@@ -719,7 +737,6 @@ func TestRunNormalCompletion(t *testing.T) {
 	fw := newTestFW()
 	mustAdd(t, fw, newFake("db", testDataStage))
 	mustAdd(t, fw, newFake("app", testBusinessStage, "db"))
-
 	if err := fw.Run(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -743,9 +760,9 @@ func TestBootstrapStageOrderFixed(t *testing.T) {
 
 func TestCustomStagesOrderAfterBootstrap(t *testing.T) {
 	fw := newTestFW()
-	mustAdd(t, fw, newFake("web", testServeStage))
-	mustAdd(t, fw, newFake("app", testBusinessStage))
 	mustAdd(t, fw, newFake("db", testDataStage))
+	mustAdd(t, fw, newFake("app", testBusinessStage))
+	mustAdd(t, fw, newFake("web", testServeStage))
 	mustAdd(t, fw, newFake("logs", LogsStage))
 
 	order, err := fw.Validate()
@@ -757,52 +774,16 @@ func TestCustomStagesOrderAfterBootstrap(t *testing.T) {
 	}
 }
 
-func TestUnregisteredStageRejected(t *testing.T) {
+func TestAddComponentAutoRegistersStage(t *testing.T) {
 	fw := New()
 	mustAdd(t, fw, newFake("rogue", Stage("not-registered")))
 
-	_, err := fw.Validate()
-	if err == nil || !strings.Contains(err.Error(), "unregistered stage") {
-		t.Fatalf("expected unregistered stage error, got %v", err)
-	}
-	if !strings.Contains(err.Error(), "not-registered") {
-		t.Fatalf("expected error to name the stage, got %v", err)
-	}
-}
-
-func TestRegisterStageValidation(t *testing.T) {
-	fw := New()
-	if err := fw.RegisterStage(""); err == nil {
-		t.Fatal("expected error for empty stage name")
-	}
-	if err := fw.RegisterStage(LogsStage); err == nil {
-		t.Fatal("expected error for re-registering a bootstrap stage")
-	}
-	if err := fw.RegisterStage(testDataStage); err != nil {
-		t.Fatalf("first RegisterStage: %v", err)
-	}
-	if err := fw.RegisterStage(testDataStage); err == nil {
-		t.Fatal("expected error for duplicate stage registration")
-	}
-}
-
-func TestRegisterStageAfterValidateResolvesAgain(t *testing.T) {
-	fw := New()
-	mustAdd(t, fw, newFake("late", Stage("late")))
-
-	if _, err := fw.Validate(); err == nil || !strings.Contains(err.Error(), "unregistered stage") {
-		t.Fatalf("expected unregistered stage error before registration, got %v", err)
-	}
-
-	if err := fw.RegisterStage("late"); err != nil {
-		t.Fatalf("RegisterStage: %v", err)
-	}
 	order, err := fw.Validate()
 	if err != nil {
-		t.Fatalf("Validate after RegisterStage: %v", err)
+		t.Fatalf("Validate: %v", err)
 	}
-	if got := strings.Join(names(order), ","); got != "late" {
-		t.Fatalf("expected late, got %q", got)
+	if got := names(order); len(got) != 1 || got[0] != "rogue" {
+		t.Fatalf("order = %v, want [rogue]", got)
 	}
 }
 

@@ -7,19 +7,17 @@ This document describes the lifecycle guarantees provided by the core
 
 ### 1. Registration
 
-Application stages are registered with `RegisterStage` in the order they should
-initialize (the framework-owned bootstrap stages — logs, configuration,
-observability, secrets — are already registered). Components are then
-registered with `AddComponent` before the framework starts. Duplicate names,
-nil components, and re-registered stages are rejected:
+Stages are auto-registered by `AddComponent`: a component's
+`GetInitOrderStage` stage is registered the first time a component declares it,
+in first-seen order after the bootstrap prefix (logs, configuration,
+observability, secrets — always registered first). There is no explicit stage
+API. Components are then registered with `AddComponent` before the framework
+starts. Duplicate names, nil components, and empty stages are rejected:
 
 ```go
 fw := caerusframework.New()
-if err := fw.RegisterStage("data"); err != nil { /* ... */ }
-if err := fw.RegisterStage("serve"); err != nil { /* ... */ }
-
-if err := fw.AddComponent(logsComp); err != nil { /* ... */ }
-if err := fw.AddComponent(mongoComp); err != nil { /* ... */ }
+if err := fw.AddComponent(dbComp); err != nil { /* ... */ }   // "data" stage auto-registered
+if err := fw.AddComponent(webComp); err != nil { /* ... */ }  // "serve" stage auto-registered after "data"
 ```
 
 ### 2. Validation (fail-fast, before anything runs)
@@ -56,6 +54,15 @@ is initialized, so a broken graph never starts a resource.
 - On **failure**, the already-initialized components are shut down in reverse
   order and the original error is returned. `Initialize` is idempotent after a
   successful run.
+- Concurrent `Initialize` calls are serialized; a second caller waits and then
+  observes the already-started state (no double-init).
+- Panics in `Init` are recovered and returned as errors (partial teardown still
+  runs).
+- **Parallel Init within a stage:** components with no unmet same-stage
+  dependencies on each other form a wave and call `Init` concurrently. The next
+  wave starts only after the previous wave finishes. Stages remain strictly
+  ordered. On failure, in-flight peers in the wave are canceled (via ctx) and
+  every successfully initialized component is shut down in reverse order.
 
 `Init` must return when the component is ready and honor `ctx`
 cancellation/deadlines. Do not store `ctx` beyond the call; use `fw` to reach
@@ -72,15 +79,22 @@ func (m *CFMongoDB) Init(ctx context.Context, fw *cf.CaerusFramework) error {
 
 ### 4. Running
 
-`Run(ctx)`:
+`Run(ctx)` (tests / embedded cancellation):
 
 1. Initializes all components (via `Initialize`).
 2. Launches every component implementing `Runnable` in a goroutine.
 3. Blocks until `ctx` is canceled **or** a runner returns an error.
-4. Shuts everything down in reverse init order and returns.
+4. Shuts everything down in reverse init order and returns. If `ctx` is already
+   canceled, Shutdown uses `context.Background()` so teardown is not starved.
+
+`RunWithSignals(ctx, opts...)` is the production entrypoint: same lifecycle,
+but stops on `SIGINT`/`SIGTERM` (override with `WithSignals`) and supports
+`WithInitTimeout` / `WithShutdownTimeout`. Shutdown after a signal uses a fresh
+background context so the canceled signal context cannot abort teardown.
 
 A runner that returns an error cancels the framework context, so other runners
-are asked to stop too:
+are asked to stop too. Concurrent `Run` / `RunWithSignals` calls are rejected.
+Panics in runners are recovered, cancel peers, and trigger shutdown:
 
 ```go
 func (w *Worker) Run(ctx context.Context) error {
@@ -127,11 +141,12 @@ It is idempotent and safe to call even if nothing was initialized. Prefer
 ## Writing a component
 
 A component lives in its own module (`github.com/caerus-framework/caerus-framework-<name>`)
-and implements `CaerusComponent`. It declares the stage it belongs to, which
-must have been registered with `RegisterStage`:
+and implements `CaerusComponent`. It declares the stage it belongs to via
+`GetInitOrderStage`; `AddComponent` registers that stage automatically, so the
+component needs no extra registration call:
 
 ```go
-const myStage = cf.Stage("my-stage") // registered via fw.RegisterStage(myStage)
+const myStage = cf.Stage("my-stage") // auto-registered on first AddComponent
 
 type CFExample struct {
     fw *cf.CaerusFramework

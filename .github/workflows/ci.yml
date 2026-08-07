@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+  branches: [main]
+  pull_request:
+  branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    uses: caerus-framework/common-actions/.github/workflows/go-module-ci.yml@main
+    with:
+      module: caerus-framework
+      deps: ""
+      coverage-min: "50"
+      caerusvet: true
+    secrets:
+      token: ${{ secrets.GH_TOKEN }}
+      codecov_token: ${{ secrets.CODECOV_TOKEN }}

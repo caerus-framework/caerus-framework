@@ -3,13 +3,9 @@
 Caerus is a minimal, component-based application framework. The core module
 (`caerus-framework`) owns only the **component contract** and the
 **lifecycle**: registration, dependency resolution, initialization, running and
-shutdown. Concrete capabilities (logging, configuration, MongoDB, gRPC, ...)
+shutdown. Concrete capabilities (logging, configuration, observability, postgresql, ...)
 live in separate modules under `github.com/caerus-framework/caerus-framework-*`.
 
-This split mirrors the original `go-panframe` idea — an opinionated
-integration layer with uniform component handling — but fixes the structural
-weaknesses: no init ordering, no error propagation, no shutdown, and a
-reflection-typed registry that panicked.
 
 ## Modules
 
@@ -18,14 +14,8 @@ reflection-typed registry that panicked.
 | `caerus-framework` | Core. Component contract + lifecycle + dependency graph. |
 | `caerus-framework-logs` | `log/slog`-based logging with stack-trace support. |
 | `caerus-framework-configuration` | Per-component config sources with validated hot-reload. |
-| `caerus-framework-mongodb` | MongoDB component (multiple clients/databases). |
-| `caerus-framework-clickhouse` | ClickHouse component. |
 | `caerus-framework-valkey` | Valkey/Redis component. |
 | `caerus-framework-postgresql` | PostgreSQL component (pgx pool). |
-| `caerus-framework-grpc` | *(future)* gRPC servers/clients. |
-
-`go-panframe` is retained in this workspace as an archive/reference and is not
-modified.
 
 ## Component contract
 
@@ -59,13 +49,12 @@ identifiers used in dependency declarations. Components are registered as their
 concrete pointer types and retrieved by type:
 
 ```go
-mongo, ok := caerusframework.Get[*cf_mongodb.CFMongoDB](fw) // or MustGet
+pg, ok := caerusframework.Get[*cf_postgres.CFPostgres](fw) // or MustGet / GetByName
 ```
 
-`Get`/`MustGet` replace the old reflection-keyed `GetIngridient(&X{}).(*X)`
-accessor: no stringly-typed reflect keys, no nil-dereference panic on a missing
-component, and the returned value is already the concrete pointer the component
-module exports.
+`Get` / `GetByName` / `MustGet` are typed lookups: no stringly reflect keys, no
+nil-dereference panic on a missing component, and the returned value is already
+the concrete pointer the component module exports.
 
 When a component must be reached by its declared `Name()` rather than its Go
 type — e.g. the configuration component resolving the owner of a config source
@@ -87,17 +76,16 @@ Ordering is a two-level model:
    | `ObservabilityStage` | Kubernetes health-check endpoints, metrics, tracing |
    | `SecretsStage` | KMS, credentials, mTLS material |
 
-   Application stages are **developer-defined**: register them with
-   `RegisterStage` in the order they should initialize, and they run after the
-   bootstrap prefix. Components declare their stage via `GetInitOrderStage`;
-   declaring a stage that was never registered is a wiring error. A component
-   whose stage is unregistered fails `Validate` before any `Init`.
+   Application stages are **developer-defined**: components declare their stage
+   via `GetInitOrderStage`, and `AddComponent` registers it automatically the
+   first time it is seen, in first-seen order, after the bootstrap prefix.
+   There is no explicit stage API: a component is ordered by its declared stage
+   relative to the other components actually added.
 
    ```go
    fw := caerusframework.New() // logs, configuration, observability, secrets already registered
-
-   if err := fw.RegisterStage("data"); err != nil { /* ... */ }     // runs 5th
-   if err := fw.RegisterStage("serve"); err != nil { /* ... */ }    // runs 6th
+   fw.AddComponent(dbComp)  // "data" stage auto-registered here, after the bootstrap prefix
+   fw.AddComponent(webComp) // "serve" stage auto-registered after "data"
    ```
 
 2. **Dependencies** are resolved **within a stage** by topological sort
@@ -147,9 +135,14 @@ at the earliest safe point:
 2. **Framework startup** — `Run`/`Initialize` resolve the graph *before* any
    component touches a resource, so a cycle never leaves an app half-started.
 
-A future static analyzer (e.g. a `go vet`-style checker) could additionally
-validate cross-package dependency declarations, but the runtime check remains
-the source of truth.
+A `go vet`-style checker — **`caerusvet`** (`go tool caerusvet ./...` from the
+core module; `go run
+github.com/caerus-framework/caerus-framework/cmd/caerusvet ./...` from
+dependents) — additionally catches Init peer lookups that are missing from
+`GetDependencies` (literals / known `ComponentName` consts). It deliberately
+prefers false negatives over false positives and does not replace runtime
+`Validate` for the assembled graph. See
+[PLAN-STATIC-DEPS.md](../../PLAN-STATIC-DEPS.md).
 
 ## Error policy
 

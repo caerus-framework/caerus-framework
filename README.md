@@ -1,10 +1,21 @@
 # caerus-framework
 
-Caerus Framework — core.
+[![CI](https://github.com/caerus-framework/caerus-framework/actions/workflows/ci.yml/badge.svg)](https://github.com/caerus-framework/caerus-framework/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/caerus-framework/caerus-framework/graph/badge.svg)](https://codecov.io/gh/caerus-framework/caerus-framework)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-A minimal, component-based application framework. The core owns the component
-contract and lifecycle only; capabilities (logs, configuration, mongo, ...)
-live in sibling `caerus-framework-*` modules.
+
+Caerus-Framework is a small Go **lifecycle framework/platform** for teams that run many Kubernetes
+services and want one shared way to wire `main`: components, dependencies,
+Init/Shutdown, and `RunWithSignals`
+— not a DI container
+- not an ORM
+- not a job platform
+
+The core owns the component contract and lifecycle only; capabilities (logs,
+configuration, observability, postgres, valkey, ...) live in sibling `caerus-framework-*`
+modules. For a runnable golden path, see
+[`caerus-framework-demoapp`](https://github.com/caerus-framework/caerus-framework-demoapp).
 
 ## Features
 
@@ -21,18 +32,87 @@ live in sibling `caerus-framework-*` modules.
   stage), reverse shutdown, and safe partial-failure teardown.
 - Typed component access via `Get` / `MustGet` (no reflection-keyed lookups).
 - Background workers via the optional `Runnable` interface.
+- Production entrypoint `RunWithSignals` (SIGINT/SIGTERM, optional init/shutdown
+  timeouts). Prefer this over bare `Run` in services.
+- Panic recovery around `Init` / runners / `Shutdown`; serialized `Initialize`.
+- Parallel `Init` within topological waves (same-stage independents concurrently).
+- **Self-sufficient components**: optional `ConfigSourceRegistrar` lets components
+  register their own configuration source; the framework owns argv entirely
+  (registrar pass → `ParseFlags`) before `Initialize`/`Run`. Flag overlay is
+  interspersed (GNU-style), and unknown flags + positional args — the app's
+  subcommand and its arguments — come back via `LeftoverArgs()` (`AbsorbArgs()`
+  for early access). `main` touches `os.Args` nowhere.
+- **Job-only migrate path**: the framework asks configuration (via `cf.JobSource`)
+  whether any module-declared **job flag** is set (e.g. postgresql's
+  `--postgresql.job=migrate` — the flag names the instance, the value names the
+  task); if so it runs core + the named target component's `RunJob` (Migrator
+  accepted for the `migrate` task) then exits. `fw.Migrate(ctx, target)` is the
+  explicit sugar for multi-tool binaries.
+- Optional `FrameworkOptions.Args` for binaries that must strip a binary-level
+  prefix before absorption (default `os.Args[1:]`).
 
 ## Quick start
 
-```go
-fw := caerusframework.New()
-fw.AddComponent(logsComp)   // e.g. caerus-framework-logs
-fw.AddComponent(mongoComp)  // e.g. caerus-framework-mongodb, depends on "logs"
-fw.AddComponent(appComp)    // depends on "logs", "mongodb"
+`main` declares **chassis + app**. Logs, configuration, and observability are
+always-on core (seeded via `FrameworkOptions`). Components own their config
+sources; the framework absorbs argv. Prefer `RunWithSignals` in services.
 
-if _, err := fw.Validate(); err != nil { /* wiring broken */ }
-if err := fw.Run(ctx); err != nil { /* app failed */ }
+```go
+package main
+
+import (
+	"context"
+	"log"
+	"time"
+
+	cf "github.com/caerus-framework/caerus-framework"
+	cf_postgres "github.com/caerus-framework/caerus-framework-postgresql"
+	cf_valkey "github.com/caerus-framework/caerus-framework-valkey"
+
+	"example.com/myapp/internal/app"
+)
+
+func main() {
+	fw := cf.New(&cf.FrameworkOptions{
+		Logs: &cf.LogsSettings{
+			Format:       "json",
+			Level:        "info",
+			ConfigSource: "logs",
+		},
+		Observability: &cf.ObservabilitySettings{
+			Address:      ":9090", // /livez, /readyz, /metrics
+			ConfigSource: "observability",
+		},
+		Components: []cf.CaerusComponent{
+			cf_postgres.New(
+				cf_postgres.WithConfigSource("postgresql", "config/postgresql.json"),
+				// WithEmbeddedMigrations(embedFS, "migrations") when you ship SQL.
+				// Local only: WithMigrateOnInit(). Prod: `--postgresql.job=migrate` Job.
+			),
+			cf_valkey.New(
+				cf_valkey.WithConfigSource("valkey", "config/valkey.json"),
+			),
+			app.New(app.Options{}), // product HTTP / Subcomponents live here
+		},
+	})
+
+	if err := fw.RunWithSignals(context.Background(),
+		cf.WithShutdownTimeout(15*time.Second),
+	); err != nil {
+		log.Fatal(err)
+	}
+}
 ```
+
+Process shapes are **job flags**, not subcommands — e.g.
+`myapp --postgresql.job=migrate` initializes only that component’s dependency
+closure, runs the task, exits (no Runnables).
+
+Full golden path (Compose, seed, interest VPQ, catalog-summary):
+[`caerus-framework-demoapp`](https://github.com/caerus-framework/caerus-framework-demoapp).
+
+`AddComponent` / bare `cf.New()` without options remain valid for tests and
+embedded use; production services should follow the shape above.
 
 ## Docs
 
@@ -41,3 +121,7 @@ if err := fw.Run(ctx); err != nil { /* app failed */ }
 - [docs/LIFECYCLE.md](docs/LIFECYCLE.md) — lifecycle guarantees and how to
   write a component.
 - [`component_example/`](component_example/) — compilable example component.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).

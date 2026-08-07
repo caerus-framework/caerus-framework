@@ -17,11 +17,13 @@ type graphNode struct {
 }
 
 // resolveOrder orders components by registered stage and, within each stage, by
-// the component dependency graph.
+// the component dependency graph. It is the flattened form of resolveWaves:
+// components that can initialize concurrently appear adjacent in registration
+// order within each wave.
 //
 // Stages are an ordered list. The framework-owned bootstrap stages (logs,
 // configuration, observability, secrets) come first in a fixed order, followed
-// by application stages in the order they were registered with RegisterStage.
+// by application stages in first-seen order (auto-registered on AddComponent).
 // Every component in an earlier stage initializes before any component in a
 // later stage. A dependency may therefore only reference a component in the
 // same or an earlier stage; a dependency that points to a later stage is a
@@ -30,11 +32,28 @@ type graphNode struct {
 //
 // Within a stage, dependencies between same-stage components give fine-grained
 // ordering and are resolved by topological sort (Kahn's algorithm).
-// Components that are simultaneously ready are emitted in registration
+// Components that are simultaneously ready form one init wave (Initialize runs
+// those in parallel). Ties within a wave are broken by registration
 // (AddComponent) order, which keeps resolution deterministic. Because forward
 // stage references are rejected, a cycle can only exist within a single stage.
 // Unknown dependency names, unregistered stages, and cycles are errors.
 func (f *CaerusFramework) resolveOrder() ([]CaerusComponent, error) {
+	waves, err := f.resolveWaves()
+	if err != nil {
+		return nil, err
+	}
+	var order []CaerusComponent
+	for _, wave := range waves {
+		order = append(order, wave...)
+	}
+	return order, nil
+}
+
+// resolveWaves returns the initialization waves: each inner slice is a set of
+// components that have no unmet same-stage dependencies on each other and may
+// Init concurrently. Waves are ordered so every dependency (cross-stage or
+// same-stage) appears in an earlier wave.
+func (f *CaerusFramework) resolveWaves() ([][]CaerusComponent, error) {
 	stageIndex := make(map[Stage]int, len(f.stages))
 	for i, s := range f.stages {
 		stageIndex[s] = i
@@ -52,7 +71,7 @@ func (f *CaerusFramework) resolveOrder() ([]CaerusComponent, error) {
 		}
 		if _, ok := stageIndex[n.stage]; !ok {
 			return nil, fmt.Errorf(
-				"caerus: component %q declares unregistered stage %q; register it with RegisterStage before Validate/Run",
+				"caerus: internal invariant violated: component %q is in unregistered stage %q (AddComponent should have registered it)",
 				n.name, n.stage,
 			)
 		}
@@ -80,7 +99,7 @@ func (f *CaerusFramework) resolveOrder() ([]CaerusComponent, error) {
 		}
 	}
 
-	var order []CaerusComponent
+	var waves [][]CaerusComponent
 	for _, stage := range f.stages {
 		stageNodes := make([]*graphNode, 0, len(nodes))
 		for _, n := range nodes {
@@ -91,21 +110,19 @@ func (f *CaerusFramework) resolveOrder() ([]CaerusComponent, error) {
 		if len(stageNodes) == 0 {
 			continue
 		}
-		stageInitOrder, err := orderStage(stageNodes, byName)
+		stageWaves, err := orderStageWaves(stageNodes, byName)
 		if err != nil {
 			return nil, err
 		}
-		order = append(order, stageInitOrder...)
+		waves = append(waves, stageWaves...)
 	}
-	return order, nil
+	return waves, nil
 }
 
-// orderStage topologically sorts the components of a single stage using only
-// the edges between components of the same stage. Dependencies on earlier
-// stages are already satisfied by the stage ordering, so they are ignored
-// here. Ties between simultaneously-ready components are broken by
-// registration order, which keeps the result deterministic.
-func orderStage(stage []*graphNode, byName map[string]*graphNode) ([]CaerusComponent, error) {
+// orderStageWaves topologically sorts one stage into Kahn waves. Dependencies
+// on earlier stages are already satisfied by stage ordering and are ignored.
+// Each wave is sorted by registration index for determinism.
+func orderStageWaves(stage []*graphNode, byName map[string]*graphNode) ([][]CaerusComponent, error) {
 	// adj[x] = same-stage components that depend on x.
 	adj := make(map[string][]string, len(stage))
 	indegree := make(map[string]int, len(stage))
@@ -126,21 +143,30 @@ func orderStage(stage []*graphNode, byName map[string]*graphNode) ([]CaerusCompo
 		}
 	}
 
-	order := make([]CaerusComponent, 0, len(stage))
+	var waves [][]CaerusComponent
+	seen := 0
 	for len(ready) > 0 {
 		sort.SliceStable(ready, func(i, j int) bool { return ready[i].index < ready[j].index })
-		n := ready[0]
-		ready = ready[1:]
-		order = append(order, n.component)
-		for _, dependent := range adj[n.name] {
-			indegree[dependent]--
-			if indegree[dependent] == 0 {
-				ready = append(ready, byName[dependent])
+		wave := make([]CaerusComponent, len(ready))
+		for i, n := range ready {
+			wave[i] = n.component
+		}
+		waves = append(waves, wave)
+		seen += len(ready)
+
+		next := make([]*graphNode, 0, len(ready))
+		for _, n := range ready {
+			for _, dependent := range adj[n.name] {
+				indegree[dependent]--
+				if indegree[dependent] == 0 {
+					next = append(next, byName[dependent])
+				}
 			}
 		}
+		ready = next
 	}
 
-	if len(order) != len(stage) {
+	if seen != len(stage) {
 		roots := make([]string, 0, len(stage))
 		for _, n := range stage {
 			roots = append(roots, n.name)
@@ -150,7 +176,7 @@ func orderStage(stage []*graphNode, byName map[string]*graphNode) ([]CaerusCompo
 		}
 		return nil, errors.New("caerus: cyclic component dependency detected")
 	}
-	return order, nil
+	return waves, nil
 }
 
 // findCycle returns one concrete dependency cycle as a path of component
