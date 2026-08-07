@@ -169,12 +169,20 @@ jobs:
           git push origin "${VERSION}"
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.ver.outputs.version }}
-          name: ${{ steps.ver.outputs.version }}
-          generate_release_notes: true
-          fail_on_unmatched_files: false
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          # gh is preinstalled on github-hosted runners; uses the job's default
+          # GITHUB_TOKEN from the environment (no third-party action).
+          if gh release view "${VERSION}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release ${VERSION} already exists"
+            exit 0
+          fi
+          gh release create "${VERSION}" \
+            --repo "${{ github.repository }}" \
+            --title "${VERSION}" \
+            --generate-notes
 
       # Speeds first `go get` after a public tag; ignore non-200 while indexing.
       - name: Prefetch proxy.golang.org
