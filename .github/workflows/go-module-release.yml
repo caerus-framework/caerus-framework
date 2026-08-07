@@ -173,8 +173,9 @@ jobs:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
-          # gh is preinstalled on github-hosted runners; uses the job's default
-          # GITHUB_TOKEN from the environment (no third-party action).
+          # Actions injects GITHUB_TOKEN into every step; gh only looks at GH_TOKEN.
+          # This is the job identity (permissions: contents: write), not a repo secret.
+          export GH_TOKEN="${GITHUB_TOKEN}"
           if gh release view "${VERSION}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             echo "Release ${VERSION} already exists"
             exit 0
