@@ -1,0 +1,196 @@
+# Reusable release for caerus-framework Go modules.
+#
+# Publishing channel for Go libraries is SemVer git tags. Creating a GitHub
+# Release from that tag is the recommended UX; proxy.golang.org serves public
+# tags (no upload step). No PATs or caller secrets — job permissions +
+# actions/checkout credentials only.
+name: Go module release
+
+on:
+  workflow_call:
+    inputs:
+      module:
+        description: Directory / repo name of this module
+        type: string
+        required: true
+      deps:
+        description: Space-separated sibling repo names for replace-path CI
+        type: string
+        required: false
+        default: ""
+      go-version:
+        type: string
+        required: false
+        default: "1.26.x"
+      version:
+        description: Tag to create when invoked via workflow_dispatch (e.g. v0.1.0). Leave empty on tag-push.
+        type: string
+        required: false
+        default: ""
+      poke-proxy:
+        description: After release, request the module from proxy.golang.org
+        type: boolean
+        required: false
+        default: true
+      valkey:
+        description: Start Valkey and set VALKEY_ADDR so integration tests run before release
+        type: boolean
+        required: false
+        default: false
+      postgres:
+        description: Start Postgres and set POSTGRES_ADDR/PASSWORD so integration tests run before release
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve version
+        id: ver
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_VERSION}" ]; then
+            VERSION="${INPUT_VERSION}"
+          elif [ "${REF_TYPE}" = "tag" ]; then
+            VERSION="${REF_NAME}"
+          else
+            echo "No version: push a v* tag or pass workflow_dispatch version" >&2
+            exit 1
+          fi
+          case "${VERSION}" in
+            v*) ;;
+            *) VERSION="v${VERSION}" ;;
+          esac
+          if ! [[ "${VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-].*)?$ ]]; then
+            echo "Invalid SemVer tag: ${VERSION} (want vMAJOR.MINOR.PATCH)" >&2
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout module
+        uses: actions/checkout@v4
+        with:
+          path: ${{ inputs.module }}
+          fetch-depth: 0
+
+      - name: Checkout sibling dependencies
+        if: inputs.deps != ''
+        env:
+          DEPS: ${{ inputs.deps }}
+        run: |
+          set -euo pipefail
+          # Public HTTPS clones (no credentials).
+          for dep in $DEPS; do
+            git clone --depth 1 \
+              "https://github.com/caerus-framework/${dep}.git" \
+              "${dep}"
+          done
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go-version }}
+          cache-dependency-path: ${{ inputs.module }}/go.sum
+
+      - name: Start Valkey
+        if: inputs.valkey
+        run: |
+          set -euo pipefail
+          docker run -d --name caerus-valkey -p 6379:6379 valkey/valkey:8
+          for i in $(seq 1 30); do
+            if docker exec caerus-valkey valkey-cli ping | grep -q PONG; then
+              echo "Valkey ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Valkey failed to become ready" >&2
+          docker logs caerus-valkey || true
+          exit 1
+
+      - name: Start Postgres
+        if: inputs.postgres
+        run: |
+          set -euo pipefail
+          docker run -d --name caerus-postgres \
+            -e POSTGRES_PASSWORD=secret \
+            -e POSTGRES_USER=postgres \
+            -e POSTGRES_DB=postgres \
+            -p 5432:5432 \
+            postgres:16
+          for i in $(seq 1 30); do
+            if docker exec caerus-postgres pg_isready -U postgres >/dev/null 2>&1; then
+              echo "Postgres ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Postgres failed to become ready" >&2
+          docker logs caerus-postgres || true
+          exit 1
+
+      - name: Vet
+        working-directory: ${{ inputs.module }}
+        run: go vet ./...
+
+      - name: Test
+        working-directory: ${{ inputs.module }}
+        env:
+          VALKEY_ADDR: ${{ inputs.valkey && '127.0.0.1:6379' || '' }}
+          POSTGRES_ADDR: ${{ inputs.postgres && '127.0.0.1:5432' || '' }}
+          POSTGRES_USER: ${{ inputs.postgres && 'postgres' || '' }}
+          POSTGRES_PASSWORD: ${{ inputs.postgres && 'secret' || '' }}
+        run: go test -race -count=1 ./...
+
+      - name: Create tag if missing
+        working-directory: ${{ inputs.module }}
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          if git rev-parse "${VERSION}" >/dev/null 2>&1; then
+            echo "Tag ${VERSION} already exists"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${VERSION}" -m "Release ${VERSION}"
+          # Uses credentials from actions/checkout (persist-credentials default).
+          git push origin "${VERSION}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.version }}
+          name: ${{ steps.ver.outputs.version }}
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+
+      # Speeds first `go get` after a public tag; ignore non-200 while indexing.
+      - name: Prefetch proxy.golang.org
+        if: inputs.poke-proxy
+        working-directory: ${{ inputs.module }}
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          MODULE="$(go list -m -f '{{.Path}}')"
+          URL="https://proxy.golang.org/${MODULE}/@v/${VERSION}.info"
+          echo "GET ${URL}"
+          code="$(curl -sS -o /tmp/proxy-info -w '%{http_code}' "${URL}" || true)"
+          echo "proxy HTTP ${code}"
+          if [ "${code}" = "200" ]; then
+            cat /tmp/proxy-info
+          else
+            echo "Proxy not serving yet (still indexing); tag is source of truth."
+          fi

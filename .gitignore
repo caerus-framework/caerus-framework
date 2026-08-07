@@ -1,0 +1,14 @@
+# Built tools (never commit)
+/caerusvet
+/bin/
+*.exe
+*.test
+*.out
+
+# Coverage / IDE
+coverage.out
+coverage.html
+.idea/
+.vscode/
+*.swp
+.DS_Store

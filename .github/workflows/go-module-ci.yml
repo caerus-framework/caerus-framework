@@ -1,0 +1,214 @@
+# Reusable CI for caerus-framework Go modules (separate git repos with local replace deps).
+#
+# Caller example (unit only):
+#   jobs:
+#     test:
+#       uses: caerus-framework/caerus-framework/.github/workflows/go-module-ci.yml@main
+#       with:
+#         module: caerus-framework-logs
+#         deps: caerus-framework
+#
+# Caller example (integration + coverage):
+#   jobs:
+#     test:
+#       uses: caerus-framework/caerus-framework/.github/workflows/go-module-ci.yml@main
+#       with:
+#         module: caerus-framework-vpq
+#         deps: "caerus-framework caerus-framework-logs caerus-framework-valkey caerus-framework-configuration"
+#         valkey: true
+#         coverage-min: "40"
+name: Go module CI
+
+on:
+  workflow_call:
+    inputs:
+      module:
+        description: Directory / repo name of this module (e.g. caerus-framework-logs)
+        type: string
+        required: true
+      deps:
+        description: Space-separated sibling repo names to check out next to the module (for go.mod replace paths)
+        type: string
+        required: false
+        default: ""
+      go-version:
+        description: Go toolchain version
+        type: string
+        required: false
+        default: "1.26.x"
+      valkey:
+        description: Start Valkey and set VALKEY_ADDR so integration tests run
+        type: boolean
+        required: false
+        default: false
+      postgres:
+        description: Start Postgres and set POSTGRES_ADDR/PASSWORD so integration tests run
+        type: boolean
+        required: false
+        default: false
+      coverage:
+        description: Write coverage profile, print summary, upload artifact
+        type: boolean
+        required: false
+        default: true
+      coverage-min:
+        description: Fail if total coverage % is below this (empty = no gate)
+        type: string
+        required: false
+        default: ""
+      caerusvet:
+        description: Run the static dependency checker (caerusvet) over ./...
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@v4
+        with:
+          path: ${{ inputs.module }}
+
+      - name: Checkout sibling dependencies
+        if: inputs.deps != ''
+        env:
+          DEPS: ${{ inputs.deps }}
+        run: |
+          set -euo pipefail
+          # Public HTTPS clones (no credentials).
+          for dep in $DEPS; do
+            echo "Checking out caerus-framework/${dep} → ${dep}"
+            git clone --depth 1 \
+              "https://github.com/caerus-framework/${dep}.git" \
+              "${dep}"
+          done
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go-version }}
+          cache-dependency-path: ${{ inputs.module }}/go.sum
+
+      - name: Start Valkey
+        if: inputs.valkey
+        run: |
+          set -euo pipefail
+          docker run -d --name caerus-valkey -p 6379:6379 valkey/valkey:8
+          for i in $(seq 1 30); do
+            if docker exec caerus-valkey valkey-cli ping | grep -q PONG; then
+              echo "Valkey ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Valkey failed to become ready" >&2
+          docker logs caerus-valkey || true
+          exit 1
+
+      - name: Start Postgres
+        if: inputs.postgres
+        run: |
+          set -euo pipefail
+          docker run -d --name caerus-postgres \
+            -e POSTGRES_PASSWORD=secret \
+            -e POSTGRES_USER=postgres \
+            -e POSTGRES_DB=postgres \
+            -p 5432:5432 \
+            postgres:16
+          for i in $(seq 1 30); do
+            if docker exec caerus-postgres pg_isready -U postgres >/dev/null 2>&1; then
+              echo "Postgres ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Postgres failed to become ready" >&2
+          docker logs caerus-postgres || true
+          exit 1
+
+      - name: Vet
+        working-directory: ${{ inputs.module }}
+        run: go vet ./...
+
+      - name: Static dependency check (caerusvet)
+        if: inputs.caerusvet
+        working-directory: ${{ inputs.module }}
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.module }}" = "caerus-framework" ]; then
+            go run ./cmd/caerusvet ./...
+          else
+            go run github.com/caerus-framework/caerus-framework/cmd/caerusvet ./...
+          fi
+
+      - name: Test
+        working-directory: ${{ inputs.module }}
+        env:
+          VALKEY_ADDR: ${{ inputs.valkey && '127.0.0.1:6379' || '' }}
+          POSTGRES_ADDR: ${{ inputs.postgres && '127.0.0.1:5432' || '' }}
+          POSTGRES_USER: ${{ inputs.postgres && 'postgres' || '' }}
+          POSTGRES_PASSWORD: ${{ inputs.postgres && 'secret' || '' }}
+          COVERAGE: ${{ inputs.coverage }}
+        run: |
+          set -euo pipefail
+          if [ "${COVERAGE}" = "true" ]; then
+            go test -race -count=1 -covermode=atomic -coverprofile=coverage.out ./...
+          else
+            go test -race -count=1 ./...
+          fi
+
+      - name: Coverage summary
+        if: inputs.coverage
+        working-directory: ${{ inputs.module }}
+        env:
+          COVERAGE_MIN: ${{ inputs.coverage-min }}
+        run: |
+          set -euo pipefail
+          go tool cover -func=coverage.out | tee coverage.txt
+          total="$(go tool cover -func=coverage.out | awk '/^total:/ {print $3}' | tr -d '%')"
+          echo "Total coverage: ${total}%"
+          {
+            echo "## Coverage (${{ inputs.module }})"
+            echo ""
+            echo "Total: **${total}%**"
+            echo ""
+            echo '```'
+            tail -n 20 coverage.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "${COVERAGE_MIN}" ]; then
+            awk -v t="$total" -v m="$COVERAGE_MIN" 'BEGIN {
+              if ((t+0) < (m+0)) {
+                printf "coverage %.1f%% is below minimum %s%%\n", t, m > "/dev/stderr"
+                exit 1
+              }
+            }'
+          fi
+
+      - name: Upload coverage artifact
+        if: inputs.coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ inputs.module }}
+          path: |
+            ${{ inputs.module }}/coverage.out
+            ${{ inputs.module }}/coverage.txt
+          if-no-files-found: error
+
+      # Tokenless upload for public repos (Codecov org: token auth "Not required").
+      - name: Upload coverage to Codecov
+        if: inputs.coverage
+        uses: codecov/codecov-action@v5
+        with:
+          files: ${{ inputs.module }}/coverage.out
+          flags: ${{ inputs.module }}
+          name: ${{ inputs.module }}
+          slug: caerus-framework/${{ inputs.module }}
+          fail_ci_if_error: false
+          disable_search: true
