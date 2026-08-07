@@ -15,10 +15,8 @@ permissions:
 
 jobs:
   release:
-    uses: caerus-framework/common-actions/.github/workflows/go-module-release.yml@main
+    uses: caerus-framework/caerus-framework/.github/workflows/go-module-release.yml@main
     with:
       module: caerus-framework
       deps: ""
       version: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
-    secrets:
-      token: ${{ secrets.GH_TOKEN }}
