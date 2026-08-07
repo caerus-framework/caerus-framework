@@ -171,11 +171,11 @@ jobs:
       - name: Create GitHub Release
         env:
           VERSION: ${{ steps.ver.outputs.version }}
+          # Job identity for gh (not a configured secret). Required: gh ignores
+          # an unset token, and set -u rejects a missing GITHUB_TOKEN export.
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # Actions injects GITHUB_TOKEN into every step; gh only looks at GH_TOKEN.
-          # This is the job identity (permissions: contents: write), not a repo secret.
-          export GH_TOKEN="${GITHUB_TOKEN}"
           if gh release view "${VERSION}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             echo "Release ${VERSION} already exists"
             exit 0
