@@ -141,8 +141,8 @@ github.com/caerus-framework/caerus-framework/cmd/caerusvet ./...` from
 dependents) — additionally catches Init peer lookups that are missing from
 `GetDependencies` (literals / known `ComponentName` consts). It deliberately
 prefers false negatives over false positives and does not replace runtime
-`Validate` for the assembled graph. See
-[PLAN-STATIC-DEPS.md](../../PLAN-STATIC-DEPS.md).
+`Validate` for the assembled graph. The analyzer lives at
+[`cmd/caerusvet`](../cmd/caerusvet).
 
 ## Error policy
 
