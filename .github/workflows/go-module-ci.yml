@@ -139,13 +139,7 @@ jobs:
       - name: Static dependency check (caerusvet)
         if: inputs.caerusvet
         working-directory: ${{ inputs.module }}
-        run: |
-          set -euo pipefail
-          if [ "${{ inputs.module }}" = "caerus-framework" ]; then
-            go run ./cmd/caerusvet ./...
-          else
-            go run github.com/caerus-framework/caerus-framework/cmd/caerusvet ./...
-          fi
+        run: go tool caerusvet ./...
 
       - name: Test
         working-directory: ${{ inputs.module }}
