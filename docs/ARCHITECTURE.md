@@ -136,9 +136,8 @@ at the earliest safe point:
    component touches a resource, so a cycle never leaves an app half-started.
 
 A `go vet`-style checker — **`caerusvet`** (`go tool caerusvet ./...` from the
-core module; `go run
-github.com/caerus-framework/caerus-framework/cmd/caerusvet ./...` from
-dependents) — additionally catches Init peer lookups that are missing from
+core module or any dependent whose go.mod declares the `tool` directive) —
+additionally catches Init peer lookups that are missing from
 `GetDependencies` (literals / known `ComponentName` consts). It deliberately
 prefers false negatives over false positives and does not replace runtime
 `Validate` for the assembled graph. The analyzer lives at
