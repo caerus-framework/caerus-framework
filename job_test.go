@@ -436,3 +436,47 @@ func TestRunWithSignalsJobRequestMultipleTargets(t *testing.T) {
 		t.Fatalf("sibling initialized %d times during job, want 0", got)
 	}
 }
+
+func TestRunJobRefusesAfterInitialize(t *testing.T) {
+	fw := newTestFW()
+	conf := &fakeConf{fake: newFake("configuration", ConfigurationStage)}
+	db := &migrator{fake: newFake("db", testDataStage)}
+	mustAdd(t, fw, conf)
+	mustAdd(t, fw, db)
+
+	if err := fw.Initialize(context.Background()); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	err := fw.Migrate(context.Background(), "db")
+	if err == nil {
+		t.Fatal("expected Migrate to refuse after Initialize")
+	}
+	if !strings.Contains(err.Error(), "cannot run jobs after Initialize") {
+		t.Fatalf("error = %v, want cannot run jobs after Initialize", err)
+	}
+	if got := db.migrateCalls.Load(); got != 0 {
+		t.Fatalf("Migrate ran %d times after refuse, want 0", got)
+	}
+}
+
+func TestRunJobSurfacesShutdownError(t *testing.T) {
+	fw := newTestFW()
+	conf := &fakeConf{fake: newFake("configuration", ConfigurationStage)}
+	db := &migrator{fake: newFake("db", testDataStage)}
+	db.shut = func(context.Context) error {
+		return errors.New("shutdown boom")
+	}
+	mustAdd(t, fw, conf)
+	mustAdd(t, fw, db)
+
+	err := fw.Migrate(context.Background(), "db")
+	if err == nil {
+		t.Fatal("expected Shutdown error from Migrate")
+	}
+	if !strings.Contains(err.Error(), "shutdown boom") {
+		t.Fatalf("error = %v, want shutdown boom", err)
+	}
+	if got := db.migrateCalls.Load(); got != 1 {
+		t.Fatalf("Migrate called %d times, want 1", got)
+	}
+}

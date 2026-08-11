@@ -77,7 +77,7 @@ func (f *CaerusFramework) RunWithSignals(ctx context.Context, opts ...RunOption)
 		return err
 	}
 	if len(reqs) > 0 {
-		return f.runJobs(initCtx, reqs)
+		return f.runJobs(initCtx, reqs, cfg)
 	}
 
 	if err := f.Initialize(initCtx); err != nil {
