@@ -11,7 +11,9 @@
 //
 //	go vet -vettool=$(go tool -n caerusvet) ./...
 //
-// See PLAN-STATIC-DEPS.md for the design and success criteria.
+// caerusvet prefers false negatives over false positives: names that cannot
+// be resolved statically are skipped. Runtime Validate remains authoritative
+// for the assembled graph (unknown names, missing registration, cycles).
 package main
 
 import (

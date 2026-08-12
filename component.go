@@ -64,7 +64,9 @@ type Dependencies interface {
 // Runnable). The parent must not call child Init/Run/Shutdown itself.
 //
 // Construct children in the parent's New (inert); the framework owns lifecycle.
-// See EGG.md for the app-owned product-component pattern.
+// Typical shape: an app component builds product children (queues, refreshers)
+// in New and returns them from Subcomponents(); chassis peers (postgres,
+// valkey) stay declared in main.
 type Subcomponents interface {
 	Subcomponents() []CaerusComponent
 }

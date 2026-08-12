@@ -1,13 +1,13 @@
 // Package depscheck implements a go/analysis analyzer that checks whether a
 // Caerus component's Init-time peer lookups are declared in GetDependencies.
 //
-// The framework's convention (AGENTS.md) is that every peer resolved with
-// cf.Get / cf.MustGet / cf.GetByName / cf.MustGetByName during Init must be
-// listed by name in the component's GetDependencies, so the framework
-// initializes the peer before the component. Runtime Validate only catches
-// unknown names, cycles and forward-stage edges on the assembled graph; it
-// cannot see that Init looks up a peer the component forgot to declare. This
-// analyzer is the static, build-time complement.
+// Framework convention: every peer resolved with cf.Get / cf.MustGet /
+// cf.GetByName / cf.MustGetByName during Init must be listed by name in the
+// component's GetDependencies, so the framework initializes the peer before
+// the component. Runtime Validate only catches unknown names, cycles and
+// forward-stage edges on the assembled graph; it cannot see that Init looks
+// up a peer the component forgot to declare. This analyzer is the static,
+// build-time complement.
 //
 // Analysis is deliberately conservative: names that cannot be resolved to a
 // string constant (dynamic GetByName names, types without a ComponentName
