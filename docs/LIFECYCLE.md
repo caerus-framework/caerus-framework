@@ -10,9 +10,12 @@ This document describes the lifecycle guarantees provided by the core
 Stages are auto-registered by `AddComponent`: a component's
 `GetInitOrderStage` stage is registered the first time a component declares it,
 in first-seen order after the bootstrap prefix (logs, configuration,
-observability, secrets — always registered first). There is no explicit stage
-API. Components are then registered with `AddComponent` before the framework
-starts. Duplicate names, nil components, and empty stages are rejected:
+observability, secrets — always registered first). `SecretsStage` is a
+reserved slot with no component in it today; credentials are mounted
+files plus `ConfigReloader` (see [ARCHITECTURE.md](ARCHITECTURE.md)).
+There is no explicit stage API. Components are then registered with
+`AddComponent` before the framework starts. Duplicate names, nil
+components, and empty stages are rejected:
 
 ```go
 fw := caerusframework.New()
@@ -71,14 +74,55 @@ subset of the graph and never start `Runnable`s, so a listen here would open a
 port during `--postgresql.job=migrate`. Implement `Runnable` and bind in `Run`
 (the same split `caerus-framework-http` and observability use).
 
+**Logging in `Init`:** subscribe with `OnReconfigureFor`, do not snapshot
+`Logger()`. `Logger()` is the process-global slog handle at that instant. A
+reload of `config/logs.json` rebuilds the handler; `SetLevelFor("vpq", …)`
+only affects subscribers who asked for that component `Name()`.
+`OnReconfigureFor(c.Name(), …)` delivers a filtered logger immediately and
+again on every rebuild, so the cached `*slog.Logger` stays live without
+polling. Honor `WithLogger` (tests / embedded use) via a `loggerSet` flag;
+fall back to `slog.Default()` only when no `logs` component is registered
+(unit tests that call `Init` directly). Unsubscribe in `Shutdown`.
+
+```text
+Wrong: c.logger = cf.MustGet[*cf_logs.Logs](fw).Logger()
+       → one snapshot; ignores SetLevelFor; stale after Reconfigure.
+
+Right: logs.OnReconfigureFor(c.Name(), func(l *slog.Logger) { c.logger = l })
+       → live logger keyed by this instance’s Name() (WithName aliases too).
+```
+
 ```go
-func (m *CFMongoDB) Init(ctx context.Context, fw *cf.CaerusFramework) error {
-    m.fw = fw
-    m.log = cf.MustGet[*cf_logs.Logs](fw).Logger()
-    // connect, ping, then return
+func (c *CFExample) Init(ctx context.Context, fw *cf.CaerusFramework) error {
+    c.fw = fw
+    if !c.loggerSet {
+        if logs, ok := cf.Get[*cf_logs.Logs](fw); ok {
+            c.logsSub = logs.OnReconfigureFor(c.Name(), func(l *slog.Logger) { c.logger = l })
+        }
+    }
+    // connect, ping, then return — still no net.Listen
+    return nil
+}
+
+func (c *CFExample) Shutdown(ctx context.Context) error {
+    if c.logsSub != nil {
+        c.logsSub.Unsubscribe()
+        c.logsSub = nil
+    }
     return nil
 }
 ```
+
+List `cf_logs.ComponentName` in `GetDependencies` so `Validate` and
+`caerusvet` see the peer. Use `Get` here (not `MustGet`) so a unit test
+can call `Init` without a logs component. For a **required** data peer
+(postgres, valkey), `MustGet` / `MustGetByName` in `Init` is fine — the
+framework recovers panics in `Init`. Do not call `MustGet` from an
+arbitrary goroutine.
+
+Store the **peer component pointer** and call `Client()` / `Pool()` on
+every use. Do not copy the live client once at `Init`: the owner may
+swap it on config reload, and the snapshot would be closed.
 
 ### 4. Running
 
@@ -197,8 +241,10 @@ component needs no extra registration call:
 const myStage = cf.Stage("my-stage") // auto-registered on first AddComponent
 
 type CFExample struct {
-    fw *cf.CaerusFramework
-    log *cf_logs.Logs
+    fw        *cf.CaerusFramework
+    logger    *slog.Logger
+    loggerSet bool
+    logsSub   *cf_logs.Subscription
 }
 
 func (c *CFExample) Name() string { return "example" }
@@ -208,24 +254,41 @@ func (c *CFExample) GetInitOrderStage() cf.Stage {
 }
 
 func (c *CFExample) GetDependencies() []string {
-	return []string{"logs", "configuration"} // must be registered names, in the same or an earlier stage
+	// Component Name() values (what Get / GetByName look up), not
+	// configuration source nicknames. "logs" is cf_logs.ComponentName.
+	return []string{cf_logs.ComponentName}
 }
 
 func (c *CFExample) Init(ctx context.Context, fw *cf.CaerusFramework) error {
     c.fw = fw
-    c.log = cf.MustGet[*cf_logs.Logs](fw) // recovered if this panics in Init
+    if !c.loggerSet {
+        if logs, ok := cf.Get[*cf_logs.Logs](fw); ok {
+            c.logsSub = logs.OnReconfigureFor(c.Name(), func(l *slog.Logger) { c.logger = l })
+        }
+    }
     return nil
 }
 
-func (c *CFExample) Shutdown(ctx context.Context) error { return nil }
+func (c *CFExample) Shutdown(ctx context.Context) error {
+    if c.logsSub != nil {
+        c.logsSub.Unsubscribe()
+        c.logsSub = nil
+    }
+    return nil
+}
 ```
 
 `MustGet` panics if the peer is missing. The framework recovers panics in
-`Init`, `Run`, and `Shutdown` only. Use it in `Init` and tests; do not call
-it from an arbitrary goroutine (prefer `Get` and handle `ok`).
+`Init`, `Run`, and `Shutdown` only. Use it in `Init` and tests for a
+required chassis peer; do not call it from an arbitrary goroutine (prefer
+`Get` and handle `ok`). Logs is the exception: `Get` + `OnReconfigureFor`,
+as above — not `MustGet(…).Logger()`.
 
-Optional: implement `Runnable` for a background worker **or HTTP listener**
-(bind in `Run`, never `Init`), `ConfigReloader` for `OnConfigReload(source
-string, cfg any)` notifications from the configuration component.
+Optional interfaces (`Runnable`, `Subcomponents`, `ConfigSourceRegistrar`,
+`ConfigReloader`, `JobRunner` / `Migrator`, `HealthProvider`, …) are listed
+in [ARCHITECTURE.md](ARCHITECTURE.md). You implement only what you need;
+there is no separate register call.
 
-See `component_example/caerus_example.go` for a compilable starting point.
+See `component_example/caerus_example.go` for a compilable skeleton (it
+skips logs on purpose). Copy the `OnReconfigureFor` pattern from this
+page, not from that file, when you add logging.

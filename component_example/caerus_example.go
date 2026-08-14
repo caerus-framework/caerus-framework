@@ -29,6 +29,9 @@ func (c *CaerusExample) GetInitOrderStage() caerusframework.Stage {
 
 func (c *CaerusExample) Init(ctx context.Context, fw *caerusframework.CaerusFramework) error {
 	c.fw = fw
+	// This skeleton skips logging. A real component subscribes with
+	// logs.OnReconfigureFor(c.Name(), …) in Init and Unsubscribes in
+	// Shutdown — see docs/LIFECYCLE.md. Do not snapshot Logger().
 	return nil
 }
 

@@ -125,6 +125,8 @@ embedded use; production services should follow the shape above.
 - [docs/LIFECYCLE.md](docs/LIFECYCLE.md) — lifecycle guarantees and how to
   write a component.
 - [`component_example/`](component_example/) — compilable example component.
+- [SECURITY.md](SECURITY.md) — how to report a vulnerability, supported
+  versions, and what this kernel does (and does not) guarantee.
 
 ## License
 
