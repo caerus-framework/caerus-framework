@@ -26,7 +26,8 @@ type LogsSettings struct {
 // fields keep the observability component's own construction defaults (health
 // checks on, metrics on, tracing off, address ":9090", service name "caerus").
 type ObservabilitySettings struct {
-	// Address overrides the HTTP bind address (default ":9090").
+	// Address overrides the HTTP bind address (default ":9090"). The
+	// observability component binds this address in Run, not Init.
 	Address string
 	// HealthChecks overrides the health-endpoints default (enabled).
 	HealthChecks *bool

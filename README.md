@@ -106,7 +106,9 @@ func main() {
 
 Process shapes are **job flags**, not subcommands — e.g.
 `myapp --postgresql.job=migrate` initializes only that component’s dependency
-closure, runs the task, exits (no Runnables).
+closure, runs the task, exits (no Runnables). Observability still *Inits* (it
+is a bootstrap stage) but binds `/metrics` and probes in `Run`, so a migrate
+Job does not open `:9090`.
 
 Full golden path (Compose, seed, interest VPQ, catalog-summary):
 [`caerus-framework-demoapp`](https://github.com/caerus-framework/caerus-framework-demoapp).

@@ -37,6 +37,10 @@ type CaerusComponent interface {
 	// must return when the component is ready. Honor ctx cancellation/deadlines
 	// and do not store ctx beyond this call. The framework is provided for
 	// accessing other components or shared options.
+	//
+	// Do not bind listen sockets here. Jobs initialize a subset of the graph
+	// and never start Runnables, so a listen in Init would open a port during
+	// migrate/seed. Implement [Runnable] and bind in Run.
 	Init(ctx context.Context, fw *CaerusFramework) error
 	// Shutdown gracefully stops the component. It is called in reverse init
 	// order. Keep it idempotent and return promptly when ctx is canceled or its
@@ -71,10 +75,16 @@ type Subcomponents interface {
 	Subcomponents() []CaerusComponent
 }
 
-// Runnable is an optional interface for background workers. Run is launched in
-// a goroutine after every component has initialized, and must return promptly
-// when ctx is canceled. A Runnable returning an error cancels the framework
-// run and triggers shutdown of all initialized components.
+// Runnable is an optional interface for background workers and listeners.
+// Run is launched in a goroutine after every component has initialized, and
+// must return promptly when ctx is canceled. A Runnable returning an error
+// cancels the framework run and triggers shutdown of all initialized
+// components.
+//
+// Claiming a TCP or Unix listen address belongs here, not in Init. The
+// job-only path (Migrate / RunJob / a job flag) never starts Runnables, so
+// a listener that binds in Run stays closed during migrate/seed. HTTP
+// servers (cf_http, observability probes and /metrics) follow that split.
 type Runnable interface {
 	Run(ctx context.Context) error
 }

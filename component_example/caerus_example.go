@@ -43,7 +43,8 @@ func (c *CaerusExample) GetDependencies() []string {
 }
 
 // Run is optional: implement caerusframework.Runnable to launch a background
-// worker that honors ctx cancellation.
+// worker or HTTP listener that honors ctx cancellation. Bind listen sockets
+// here, never in Init — jobs skip Runnables.
 // func (c *CaerusExample) Run(ctx context.Context) error {
 // 	<-ctx.Done()
 // 	return nil

@@ -168,7 +168,8 @@ func (f *CaerusFramework) runJobs(ctx context.Context, reqs []JobRequest, cfg ru
 // whole data plane beneath it; a data-level target like postgres pulls in only
 // the core components it needs — so a migrate job still runs when valkey is
 // down. Core (bootstrap-stage) components are always initialized regardless
-// (see isCoreStage).
+// (see isCoreStage). Those components must not bind listeners in Init: this
+// path never starts Runnables.
 func (f *CaerusFramework) jobClosure(targets []CaerusComponent) map[CaerusComponent]bool {
 	keep := make(map[CaerusComponent]bool)
 	for _, t := range targets {

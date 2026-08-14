@@ -66,7 +66,10 @@ is initialized, so a broken graph never starts a resource.
 
 `Init` must return when the component is ready and honor `ctx`
 cancellation/deadlines. Do not store `ctx` beyond the call; use `fw` to reach
-other components:
+other components. **Do not bind a listen socket in `Init`.** Jobs initialize a
+subset of the graph and never start `Runnable`s, so a listen here would open a
+port during `--postgresql.job=migrate`. Implement `Runnable` and bind in `Run`
+(the same split `caerus-framework-http` and observability use).
 
 ```go
 func (m *CFMongoDB) Init(ctx context.Context, fw *cf.CaerusFramework) error {
@@ -83,6 +86,8 @@ func (m *CFMongoDB) Init(ctx context.Context, fw *cf.CaerusFramework) error {
 
 1. Initializes all components (via `Initialize`).
 2. Launches every component implementing `Runnable` in a goroutine.
+   HTTP listeners, queue workers, and other “occupy the process until
+   cancel” work belong here — not in `Init`.
 3. Blocks until `ctx` is canceled **or** a runner returns an error.
 4. Shuts everything down in reverse init order and returns. If `ctx` is already
    canceled, Shutdown uses `context.Background()` so teardown is not starved.
@@ -114,6 +119,25 @@ func (w *Worker) Run(ctx context.Context) error {
 A clean cancellation returns `nil` (runner `context.Canceled` errors are
 normalized away).
 
+### 4b. Job-only path (no Runnables)
+
+`RunWithSignals` asks configuration whether a module job flag was set
+(for example `--postgresql.job=migrate`). If so the framework does **not**
+serve:
+
+1. Initializes the bootstrap stages plus the target’s dependency closure.
+2. Runs the named task (`JobRunner.RunJob`, or `Migrator.Migrate` for
+   `"migrate"`).
+3. Shuts down and returns. **No `Runnable` is started.**
+
+That is why listeners must bind in `Run`. Observability still *initializes*
+on a migrate Job (it is a bootstrap stage) but does not open `:9090`. The
+same is true of `caerus-framework-http` (app stage: usually not even in the
+migrate closure; even if it were, it would not listen).
+
+`fw.Migrate(ctx, target)` / `fw.RunJob(ctx, target, task)` are the same
+machine for multi-tool binaries.
+
 ### 5. Shutdown
 
 `Shutdown(ctx)` stops every initialized component in **reverse init order**
@@ -136,7 +160,7 @@ It is idempotent and safe to call even if nothing was initialized. Prefer
 | Runner failure | Framework context canceled; full shutdown; error returned |
 | Clean cancel | `Run` returns `nil` |
 | Shutdown | Reverse init order; idempotent |
-| Exits | The core never calls `os.Exit`; all failures are errors |
+| Jobs skip Runnables | Listeners that bind in `Run` stay closed during migrate/seed |
 
 ## Writing a component
 
@@ -172,7 +196,8 @@ func (c *CFExample) Init(ctx context.Context, fw *cf.CaerusFramework) error {
 func (c *CFExample) Shutdown(ctx context.Context) error { return nil }
 ```
 
-Optional: implement `Runnable` for a background worker, `ConfigReloader` for
-`OnConfigReload()` notifications from the configuration component.
+Optional: implement `Runnable` for a background worker **or HTTP listener**
+(bind in `Run`, never `Init`), `ConfigReloader` for `OnConfigReload(source
+string, cfg any)` notifications from the configuration component.
 
 See `component_example/caerus_example.go` for a compilable starting point.
