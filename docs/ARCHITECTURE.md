@@ -33,13 +33,14 @@ type CaerusComponent interface {
 Three optional interfaces extend the contract:
 
 - `Dependencies` — declares component names that must be initialized first.
-- `Runnable` — launches a background worker goroutine after initialization.
-- `ConfigReloader` — receives `OnConfigReload()` after a validated config swap.
+- `Runnable` — launches a background worker or listener after initialization.
+  Bind TCP/Unix sockets here, never in `Init` (jobs skip Runnables).
+- `ConfigReloader` — receives `OnConfigReload(source string, cfg any)` after a validated config swap.
 
 ```go
-type Dependencies interface { GetDependencies() []string }
-type Runnable       interface { Run(ctx context.Context) error }
-type ConfigReloader interface { OnConfigReload() }
+type Dependencies    interface { GetDependencies() []string }
+type Runnable        interface { Run(ctx context.Context) error }
+type ConfigReloader  interface { OnConfigReload(source string, cfg any) }
 ```
 
 ## Component naming

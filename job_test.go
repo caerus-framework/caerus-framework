@@ -283,6 +283,37 @@ func TestRunWithSignalsJobRequestRunsJobInsteadOfServing(t *testing.T) {
 	}
 }
 
+func TestRunJobDoesNotStartBootstrapRunnable(t *testing.T) {
+	fw := newTestFW()
+	conf := &fakeConf{fake: newFake("configuration", ConfigurationStage)}
+	db := &migrator{fake: newFake("db", testDataStage)}
+	var obsInit, obsRun atomic.Int32
+	obs := &runner{
+		fake: newFake("observability", ObservabilityStage),
+		run: func(context.Context) error {
+			obsRun.Add(1)
+			return nil
+		},
+	}
+	obs.init = func(context.Context) error { obsInit.Add(1); return nil }
+	mustAdd(t, fw, conf)
+	mustAdd(t, fw, obs)
+	mustAdd(t, fw, db)
+
+	if err := fw.Migrate(context.Background(), "db"); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	if obsInit.Load() != 1 {
+		t.Fatal("bootstrap-stage component was not initialized on the job path")
+	}
+	if obsRun.Load() != 0 {
+		t.Fatal("bootstrap-stage Runnable started on the job path; jobs must not call Run")
+	}
+	if db.migrateCalls.Load() != 1 {
+		t.Fatal("migrate task did not run")
+	}
+}
+
 func TestRunWithSignalsJobRequestRunsTaskOnJobRunner(t *testing.T) {
 	fw := newTestFW()
 	conf := &fakeConf{fake: newFake("configuration", ConfigurationStage)}
