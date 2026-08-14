@@ -108,7 +108,9 @@ Process shapes are **job flags**, not subcommands — e.g.
 `myapp --postgresql.job=migrate` initializes only that component’s dependency
 closure, runs the task, exits (no Runnables). Observability still *Inits* (it
 is a bootstrap stage) but binds `/metrics` and probes in `Run`, so a migrate
-Job does not open `:9090`.
+Job does not open `:9090`. Two job flags that name the same component fail
+before Init (one job per target). After a job, that process must not
+`Initialize` / `Run` / run another job — construct a new framework, or exit.
 
 Full golden path (Compose, seed, interest VPQ, catalog-summary):
 [`caerus-framework-demoapp`](https://github.com/caerus-framework/caerus-framework-demoapp).
@@ -123,6 +125,8 @@ embedded use; production services should follow the shape above.
 - [docs/LIFECYCLE.md](docs/LIFECYCLE.md) — lifecycle guarantees and how to
   write a component.
 - [`component_example/`](component_example/) — compilable example component.
+- [SECURITY.md](SECURITY.md) — how to report a vulnerability, supported
+  versions, and what this kernel does (and does not) guarantee.
 
 ## License
 

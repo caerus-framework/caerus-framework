@@ -12,10 +12,14 @@ live in separate modules under `github.com/caerus-framework/caerus-framework-*`.
 | Module | Purpose |
 |---|---|
 | `caerus-framework` | Core. Component contract + lifecycle + dependency graph. |
-| `caerus-framework-logs` | `log/slog`-based logging with stack-trace support. |
+| `caerus-framework-logs` | `log/slog` logging; components subscribe with `OnReconfigureFor`. |
 | `caerus-framework-configuration` | Per-component config sources with validated hot-reload. |
+| `caerus-framework-observability` | `/livez`, `/readyz`, `/metrics`, tracing. Binds in `Run`. |
 | `caerus-framework-valkey` | Valkey/Redis component. |
 | `caerus-framework-postgresql` | PostgreSQL component (pgx pool). |
+
+More capabilities (HTTP, VPQ, Resend, …) live in other
+`caerus-framework-*` modules. Core does not import them.
 
 ## Component contract
 
@@ -30,18 +34,49 @@ type CaerusComponent interface {
 }
 ```
 
-Three optional interfaces extend the contract:
+The four methods above are the **required** contract. Everything else is
+optional: implement an interface only when you need that behavior. The
+framework finds it with a type assert. There is no `RegisterRunnable`
+call.
 
-- `Dependencies` — declares component names that must be initialized first.
-- `Runnable` — launches a background worker or listener after initialization.
-  Bind TCP/Unix sockets here, never in `Init` (jobs skip Runnables).
-- `ConfigReloader` — receives `OnConfigReload(source string, cfg any)` after a validated config swap.
+`GetDependencies` names are component `Name()` values (registry identity),
+not configuration source names (`--postgresql`, `config/postgresql.json`).
+Prefer matching those two strings in new modules so the names look the
+same; they are still two concepts. If they differ, peers must depend on
+`Name()`.
+
+| If you need… | Implement (this module) | What it is *not* |
+|---|---|---|
+| Peers that must `Init` first | `Dependencies` | Not the config file’s source name |
+| Children built in `New` (queues, refreshers) | `Subcomponents` | Not “call child `Init` / `Run` yourself” — the framework expands the tree |
+| A worker or listen socket that occupies the process | `Runnable` | Not `Init`. Jobs never start Runnables, so a listen in `Init` would open a port during migrate |
+| A config file / env / `--flag` the module owns | `ConfigSourceRegistrar` | Not something `main` registers. Logs and observability cannot import configuration (cycle): they use `CoreConfigSource` instead |
+| Reconnect when that source reloads | `ConfigReloader` — `OnConfigReload(source string, cfg any)` | Not a fan-out to dependents. Store the **peer component** and call `Client()` / `Pool()` per use |
+| A one-shot CLI task (`--postgresql.job=migrate`) | `JobRunner` (`RunJob(ctx, task)`) | Not a second process model. `Migrator` is only a fallback for the `"migrate"` task if you have no `JobRunner` |
+| A voice on Kubernetes `/readyz` | `HealthProvider` | Not liveness (`/livez`). Not DegradedMode (that only answers “may `Initialize` finish without a live store?”) |
+
+Types authors copy:
 
 ```go
-type Dependencies    interface { GetDependencies() []string }
-type Runnable        interface { Run(ctx context.Context) error }
-type ConfigReloader  interface { OnConfigReload(source string, cfg any) }
+type Dependencies           interface { GetDependencies() []string }
+type Subcomponents          interface { Subcomponents() []CaerusComponent }
+type Runnable               interface { Run(ctx context.Context) error }
+type ConfigSourceRegistrar  interface { RegisterConfigSources(conf any) error }
+type CoreConfigSource       interface { CoreConfigSource() ([]ConfigSourceValue, error) }
+type ConfigReloader         interface { OnConfigReload(source string, cfg any) }
+type JobRunner              interface { RunJob(ctx context.Context, task string) error }
+type Migrator               interface { Migrate(ctx context.Context) error }
+type HealthProvider         interface { Health(ctx context.Context) error }
 ```
+
+`MetricsProvider` is **not** in this module. Observability defines it so
+`/metrics` can scrape data clients. Implement it in the sibling that
+exposes samples.
+
+The configuration component (not your app) also implements `ConfigArgv`,
+`JobSource`, and `ConfigSourceAdder` so the kernel can absorb argv and
+register core sources without an import cycle. Do not implement those on
+a product component.
 
 ## Component naming
 
@@ -74,8 +109,29 @@ Ordering is a two-level model:
    |---|---|
    | `LogsStage` | logging bootstrap (slog + stack traces) |
    | `ConfigurationStage` | per-component config sources |
-   | `ObservabilityStage` | Kubernetes health-check endpoints, metrics, tracing |
-   | `SecretsStage` | KMS, credentials, mTLS material |
+   | `ObservabilityStage` | Kubernetes `/livez` `/readyz` `/metrics`, tracing (listen in `Run`) |
+   | `SecretsStage` | **Reserved parking space.** Nothing occupies it today. See below. |
+
+   **Credentials are not waiting on a vault component.** Production
+   secrets are files Kubernetes (or Compose) mounts from a Secret /
+   ConfigMap. The data module registers that file as its configuration
+   source (`WithConfigSource`), `fsnotify` reloads it, and
+   `ConfigReloader` builds a new client, pings, swaps, and keeps
+   last-good on failure. That *is* the rotation plane. Process env is
+   for local/`go run` and CI; env is not watchable, so do not treat
+   env-injected Secrets as the primary credential story.
+
+   ```text
+   Wrong: leave a DSN only in POSTGRESQL_DSN and wait for SecretsStage /
+          a KMS module to “do credentials properly.”
+   Right: mount the Secret as a file, bind WithConfigSource, implement
+          OnConfigReload, last-good if reconnect fails.
+   ```
+
+   `SecretsStage` stays in the bootstrap prefix so a future credential
+   helper *could* Init before data. Do not invent a half vault in core
+   to fill the slot. Do not read that empty stage as “KMS is coming
+   next tag.”
 
    Application stages are **developer-defined**: components declare their stage
    via `GetInitOrderStage`, and `AddComponent` registers it automatically the
@@ -96,10 +152,15 @@ Ordering is a two-level model:
 ```
 app-core      (stage "business", depends on: "mongo", "kafka")
     ↓ same stage                                      ↓ earlier stage ("data")
-mongo         (stage "data", depends on: "secrets")   satisfied by stage order
+mongo         (stage "data", depends on: "configuration")
     ↓ earlier stage (bootstrap)
-secrets
+configuration
 ```
+
+That sketch does **not** use `SecretsStage`. A data module depends on
+`configuration` (and usually `logs`) and reads credentials from **its
+own** source file. There is no `secrets` component to list in
+`GetDependencies` today.
 
 Declaring a dependency on a **later stage** is a wiring error — a dependency
 can never pull a later-stage component earlier. This is validated before any
@@ -114,12 +175,14 @@ can never pull a later-stage component earlier. This is validated before any
   path, e.g. `caerus: cyclic component dependency detected: a -> b -> a`.
 
 Same-stage dependencies give fine-grained ordering when several components
-share a stage; ties are broken by registration order. This is exactly how the
-bootstrap components order themselves: even though `logs`, `configuration` and
-`secrets` all live in bootstrap stages, a `secrets -> configuration -> logs`
-dependency chain initializes them in that order. A bootstrap component never
-needs to reach outside its own stage — everything it needs is in an earlier or
-the same bootstrap stage and is ordered by dependency.
+share a stage; ties are broken by registration order. This is how the
+occupied bootstrap stages order themselves: `logs`, `configuration`, and
+`observability` live in that prefix, so a chain such as
+`observability -> configuration -> logs` initializes in that order.
+`SecretsStage` is in the prefix but empty — do not declare a dependency
+on a `"secrets"` component unless you have registered one. A bootstrap
+component never needs to reach outside the prefix: everything it needs
+is in an earlier or the same bootstrap stage.
 
 See [LIFECYCLE.md](LIFECYCLE.md) for the full lifecycle description and the
 guarantees around initialization failure and shutdown.

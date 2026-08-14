@@ -203,7 +203,8 @@ type JobRequest struct {
 // it, after absorbing argv, whether any registered source's job flag was set;
 // when one was, it reports the resolved job requests — the components whose job
 // callbacks run once the targets' dependency closure (their plane and
-// everything below it) has initialized.
+// everything below it) has initialized. Two requests that name the same
+// component are a fail-closed error (one job per target).
 type JobSource interface {
 	JobRequests() ([]JobRequest, error)
 }

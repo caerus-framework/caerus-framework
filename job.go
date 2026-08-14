@@ -2,6 +2,7 @@ package caerusframework
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -29,9 +30,9 @@ func (f *CaerusFramework) Migrate(ctx context.Context, target string) error {
 // (or [Migrator] when task is "migrate"). Use Migrate for the common migrate
 // case.
 //
-// Jobs refuse to run if the framework is already started or serving — use a
-// separate process (K8s Job / CLI) rather than mixing migrate into a live
-// serve process.
+// Jobs refuse to run if the framework is already started, serving, or has
+// already run a job — use a separate process (K8s Job / CLI) rather than
+// mixing migrate into a live serve process. One entrypoint per process.
 func (f *CaerusFramework) RunJob(ctx context.Context, target, task string) error {
 	if err := f.absorbArgs(); err != nil {
 		return err
@@ -58,8 +59,9 @@ func (f *CaerusFramework) jobRequests() ([]JobRequest, error) {
 // [Migrator] for the "migrate" task), initializes the core plus the transitive
 // dependency closure of the targets — the target's plane and everything below
 // it — runs each job in order, shuts down and returns. Nothing outside the
-// closure initializes. Fail-closed contract: an unknown target or a component
-// that cannot run the requested task is a hard error before any data Init.
+// closure initializes. Fail-closed contract: an unknown target, a component
+// that cannot run the requested task, or two requests for the same component
+// is a hard error before any data Init.
 //
 // Serialized on startMu (same as Initialize) so jobs cannot race a concurrent
 // Initialize/Run. Honors cfg.signals and cfg.shutdownTimeout when set
@@ -70,6 +72,10 @@ func (f *CaerusFramework) runJobs(ctx context.Context, reqs []JobRequest, cfg ru
 	defer f.startMu.Unlock()
 
 	f.mu.Lock()
+	if f.jobRan {
+		f.mu.Unlock()
+		return errors.New("caerus: cannot run jobs again; one entrypoint per process (construct a new framework)")
+	}
 	if f.started {
 		f.mu.Unlock()
 		return fmt.Errorf("caerus: cannot run jobs after Initialize; use a separate process for migrate/jobs")
@@ -87,13 +93,20 @@ func (f *CaerusFramework) runJobs(ctx context.Context, reqs []JobRequest, cfg ru
 		mig    Migrator
 	}
 	var calls []jobCall
-	seen := make(map[string]bool)
+	seen := make(map[string]string) // component name → first task
 	for _, r := range reqs {
 		name := strings.TrimSpace(r.Component)
-		if name == "" || seen[name] {
-			continue
+		if name == "" {
+			return fmt.Errorf("caerus: job request has an empty component name")
 		}
-		seen[name] = true
+		task := strings.TrimSpace(r.Task)
+		if task == "" {
+			return fmt.Errorf("caerus: job request for %q has an empty task", name)
+		}
+		if prev, ok := seen[name]; ok {
+			return fmt.Errorf("caerus: duplicate job target %q (task %q already requested, also got %q); one job per component per process", name, prev, task)
+		}
+		seen[name] = task
 		f.mu.Lock()
 		comp, ok := f.byName[name]
 		f.mu.Unlock()
@@ -102,7 +115,7 @@ func (f *CaerusFramework) runJobs(ctx context.Context, reqs []JobRequest, cfg ru
 		}
 		var c jobCall
 		c.comp = comp
-		c.task = strings.TrimSpace(r.Task)
+		c.task = task
 		if jr, ok := comp.(JobRunner); ok {
 			c.runner = jr
 		} else if c.task == "migrate" {
@@ -131,6 +144,9 @@ func (f *CaerusFramework) runJobs(ctx context.Context, reqs []JobRequest, cfg ru
 		targets = append(targets, c.comp)
 	}
 	keep := f.jobClosure(targets)
+	f.mu.Lock()
+	f.jobRan = true
+	f.mu.Unlock()
 	if err := f.initializeSubset(jobCtx, func(c CaerusComponent) bool { return keep[c] }); err != nil {
 		return err
 	}
@@ -202,15 +218,16 @@ func (f *CaerusFramework) jobClosure(targets []CaerusComponent) map[CaerusCompon
 // are not initialized "just in case" — runJobs hands it the targets' dependency
 // closure, so exactly the target's plane and everything below it initialize.
 //
-// Callers must hold startMu (runJobs does). Does not set started — jobs are a
-// one-shot path that Shutdown clears; a later Initialize may still run in a
-// fresh process, not after a successful job in the same process that already
-// tore down.
+// Callers must hold startMu (runJobs does). Sets no started flag — jobs are a
+// one-shot path; Shutdown clears started. jobRan stays set so Initialize / Run
+// / a second job in this process are refused (one entrypoint per process).
 func (f *CaerusFramework) initializeSubset(ctx context.Context, keep func(CaerusComponent) bool) error {
 	if err := f.absorbArgs(); err != nil {
 		return err
 	}
+	f.mu.Lock()
 	waves, err := f.resolveWaves()
+	f.mu.Unlock()
 	if err != nil {
 		return err
 	}
