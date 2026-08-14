@@ -135,6 +135,21 @@ on a migrate Job (it is a bootstrap stage) but does not open `:9090`. The
 same is true of `caerus-framework-http` (app stage: usually not even in the
 migrate closure; even if it were, it would not listen).
 
+**One job per target per process.** Two flags (or two `JobRequest`s) that
+name the same component `Name()` are a hard error before any data Init —
+even if both ask for the same task. Distinct targets in one argv are
+allowed (two named postgres instances, two `--….job=migrate` flags).
+
+**One entrypoint per process.** After a job has begun Init, this framework
+instance is spent: `Initialize`, `Run`, `RunWithSignals` (serve path), and
+a second `RunJob` / `Migrate` all fail, including after `Shutdown`.
+Construct a new framework (or, in production, exit — the K8s Job is done).
+
+`Validate` / wave resolution always see the **whole** registered graph. A
+cycle or unknown dependency on a sibling the job will not Init still fails
+the Job. That is fail-fast wiring, not a migrate bug. Do not leave broken
+components registered “because the job would not touch them.”
+
 `fw.Migrate(ctx, target)` / `fw.RunJob(ctx, target, task)` are the same
 machine for multi-tool binaries.
 
@@ -145,6 +160,12 @@ machine for multi-tool binaries.
 It is idempotent and safe to call even if nothing was initialized. Prefer
 `Run`'s automatic shutdown; call `Shutdown` explicitly only when using
 `Initialize` separately.
+
+**Do not call `Shutdown` while `Run` is in progress.** That call is refused
+(`cannot Shutdown while Run is in progress`). Cancel the `Run` context, or
+send SIGINT/SIGTERM to `RunWithSignals`; those paths drain runners and then
+`Shutdown` themselves. An extra `Shutdown` from another goroutine would tear
+postgres/valkey/HTTP out from under live `Runnable`s.
 
 ## Guarantees summary
 
@@ -159,8 +180,11 @@ It is idempotent and safe to call even if nothing was initialized. Prefer
 | Init failure | Already-initialized components are shut down in reverse order; error returned |
 | Runner failure | Framework context canceled; full shutdown; error returned |
 | Clean cancel | `Run` returns `nil` |
-| Shutdown | Reverse init order; idempotent |
+| Shutdown | Reverse init order; idempotent; **refused while Run is in progress** |
 | Jobs skip Runnables | Listeners that bind in `Run` stay closed during migrate/seed |
+| One job per target | Two flags naming the same component `Name()` fail before Init |
+| One entrypoint per process | After a job, Initialize / Run / a second job on this instance fail |
+| Whole-graph Validate | A broken unused sibling still fails a Job (wiring error) |
 
 ## Writing a component
 
@@ -189,12 +213,16 @@ func (c *CFExample) GetDependencies() []string {
 
 func (c *CFExample) Init(ctx context.Context, fw *cf.CaerusFramework) error {
     c.fw = fw
-    c.log = cf.MustGet[*cf_logs.Logs](fw)
+    c.log = cf.MustGet[*cf_logs.Logs](fw) // recovered if this panics in Init
     return nil
 }
 
 func (c *CFExample) Shutdown(ctx context.Context) error { return nil }
 ```
+
+`MustGet` panics if the peer is missing. The framework recovers panics in
+`Init`, `Run`, and `Shutdown` only. Use it in `Init` and tests; do not call
+it from an arbitrary goroutine (prefer `Get` and handle `ok`).
 
 Optional: implement `Runnable` for a background worker **or HTTP listener**
 (bind in `Run`, never `Init`), `ConfigReloader` for `OnConfigReload(source

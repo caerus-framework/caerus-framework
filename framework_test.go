@@ -438,6 +438,67 @@ func TestShutdownIdempotent(t *testing.T) {
 	}
 }
 
+func TestShutdownRefusedWhileRunning(t *testing.T) {
+	fw := newTestFW()
+	initDone := make(chan struct{})
+	worker := &runner{
+		fake: newFake("worker", testServeStage),
+		run: func(ctx context.Context) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	worker.fake.init = func(ctx context.Context) error {
+		close(initDone)
+		return nil
+	}
+	mustAdd(t, fw, worker)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- fw.Run(ctx) }()
+	<-initDone
+	time.Sleep(20 * time.Millisecond)
+
+	err := fw.Shutdown(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "cannot Shutdown while Run is in progress") {
+		t.Fatalf("expected Shutdown while Run to fail, got %v", err)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run after cancel: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after context cancel")
+	}
+}
+
+func TestAddComponentRefusedAfterInitialize(t *testing.T) {
+	fw := newTestFW()
+	mustAdd(t, fw, newFake("c", LogsStage))
+	if err := fw.Initialize(context.Background()); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	err := fw.AddComponent(newFake("late", LogsStage))
+	if err == nil || !strings.Contains(err.Error(), "cannot AddComponent after the framework has started") {
+		t.Fatalf("expected AddComponent after Initialize to fail, got %v", err)
+	}
+}
+
+func TestAbsorbArgsBareFrameworkIsIdempotent(t *testing.T) {
+	fw := newTestFW()
+	if err := fw.AbsorbArgs(); err != nil {
+		t.Fatalf("AbsorbArgs: %v", err)
+	}
+	if err := fw.AbsorbArgs(); err != nil {
+		t.Fatalf("second AbsorbArgs: %v", err)
+	}
+}
+
 func TestAddComponentValidation(t *testing.T) {
 	fw := newTestFW()
 	if err := fw.AddComponent(nil); err == nil {

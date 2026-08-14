@@ -511,3 +511,86 @@ func TestRunJobSurfacesShutdownError(t *testing.T) {
 		t.Fatalf("Migrate called %d times, want 1", got)
 	}
 }
+
+func TestRunJobsDuplicateTargetFailsClosed(t *testing.T) {
+	fw := newTestFW()
+	conf := &fakeConf{fake: newFake("configuration", ConfigurationStage)}
+	conf.parse = func(args []string) ([]string, error) { return args, nil }
+	conf.jobs = func() ([]JobRequest, error) {
+		return []JobRequest{
+			{Component: "db", Flag: "db.job", Task: "migrate"},
+			{Component: "db", Flag: "db2.job", Task: "seed"},
+		}, nil
+	}
+	db := &jobRunner{fake: newFake("db", testDataStage)}
+	var dbInit atomic.Int32
+	db.init = func(context.Context) error { dbInit.Add(1); return nil }
+	mustAdd(t, fw, conf)
+	mustAdd(t, fw, db)
+
+	err := fw.RunWithSignals(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "duplicate job target") {
+		t.Fatalf("expected duplicate job target error, got %v", err)
+	}
+	if db.runJobCalls.Load() != 0 {
+		t.Fatal("job ran despite duplicate target")
+	}
+	if dbInit.Load() != 0 {
+		t.Fatal("target initialized despite duplicate target; fail closed before Init")
+	}
+}
+
+func TestInitializeRefusedAfterJob(t *testing.T) {
+	fw := newTestFW()
+	conf := &fakeConf{fake: newFake("configuration", ConfigurationStage)}
+	db := &migrator{fake: newFake("db", testDataStage)}
+	mustAdd(t, fw, conf)
+	mustAdd(t, fw, db)
+
+	if err := fw.Migrate(context.Background(), "db"); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	err := fw.Initialize(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "cannot Initialize after a job") {
+		t.Fatalf("expected Initialize after job to fail, got %v", err)
+	}
+	err = fw.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "cannot Run after a job") {
+		t.Fatalf("expected Run after job to fail, got %v", err)
+	}
+}
+
+func TestSecondJobRefusedAfterShutdown(t *testing.T) {
+	fw := newTestFW()
+	conf := &fakeConf{fake: newFake("configuration", ConfigurationStage)}
+	db := &migrator{fake: newFake("db", testDataStage)}
+	mustAdd(t, fw, conf)
+	mustAdd(t, fw, db)
+
+	if err := fw.Migrate(context.Background(), "db"); err != nil {
+		t.Fatalf("first Migrate: %v", err)
+	}
+	err := fw.Migrate(context.Background(), "db")
+	if err == nil || !strings.Contains(err.Error(), "cannot run jobs again") {
+		t.Fatalf("expected second job to fail, got %v", err)
+	}
+	if db.migrateCalls.Load() != 1 {
+		t.Fatalf("Migrate called %d times, want 1", db.migrateCalls.Load())
+	}
+}
+
+func TestAddComponentRefusedAfterJob(t *testing.T) {
+	fw := newTestFW()
+	conf := &fakeConf{fake: newFake("configuration", ConfigurationStage)}
+	db := &migrator{fake: newFake("db", testDataStage)}
+	mustAdd(t, fw, conf)
+	mustAdd(t, fw, db)
+
+	if err := fw.Migrate(context.Background(), "db"); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	err := fw.AddComponent(newFake("late", testDataStage))
+	if err == nil || !strings.Contains(err.Error(), "cannot AddComponent after the framework has started") {
+		t.Fatalf("expected AddComponent after job to fail, got %v", err)
+	}
+}

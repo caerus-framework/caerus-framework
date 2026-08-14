@@ -22,6 +22,7 @@ type CaerusFramework struct {
 	initialized  []CaerusComponent
 	started      bool
 	running      bool
+	jobRan       bool     // set when a job path begins Init; Shutdown does not clear it
 	optsArgs     []string // process argv to absorb (FrameworkOptions.Args; nil = os.Args[1:])
 	leftover     []string // args ParseFlags did not consume (subcommands, app flags)
 	argsAbsorbed bool     // ConfigSourceRegistrars ran and argv was parsed
@@ -56,9 +57,16 @@ func New(opts ...*FrameworkOptions) *CaerusFramework {
 // initialization stage (GetInitOrderStage) is registered automatically the
 // first time it is seen, after the bootstrap stages, in first-seen order —
 // components declare what they belong to, so there is no separate stage API.
+//
+// AddComponent is refused after Initialize, after a job has begun, or while
+// Run is in progress. Tests that need a different graph construct a new
+// framework.
 func (f *CaerusFramework) AddComponent(c CaerusComponent) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.started || f.running || f.jobRan {
+		return errors.New("caerus: cannot AddComponent after the framework has started; construct a new framework")
+	}
 	return f.addComponentTreeLocked(c)
 }
 
@@ -161,6 +169,10 @@ func (f *CaerusFramework) Initialize(ctx context.Context) error {
 	}
 
 	f.mu.Lock()
+	if f.jobRan {
+		f.mu.Unlock()
+		return errors.New("caerus: cannot Initialize after a job; one entrypoint per process (construct a new framework)")
+	}
 	if f.started {
 		f.mu.Unlock()
 		return nil
@@ -170,7 +182,9 @@ func (f *CaerusFramework) Initialize(ctx context.Context) error {
 	if _, err := f.Validate(); err != nil {
 		return err
 	}
+	f.mu.Lock()
 	waves, err := f.resolveWaves()
+	f.mu.Unlock()
 	if err != nil {
 		return err
 	}
@@ -264,6 +278,13 @@ func (f *CaerusFramework) initWave(ctx context.Context, wave []CaerusComponent) 
 // Concurrent Run calls are rejected. Panics in runners are recovered and
 // returned as errors (and cancel peer runners).
 func (f *CaerusFramework) Run(ctx context.Context) error {
+	f.mu.Lock()
+	jobRan := f.jobRan
+	f.mu.Unlock()
+	if jobRan {
+		return errors.New("caerus: cannot Run after a job; one entrypoint per process (construct a new framework)")
+	}
+
 	if err := f.ensureInitialized(ctx); err != nil {
 		return err
 	}
@@ -341,8 +362,17 @@ func (f *CaerusFramework) runRunners(ctx context.Context) error {
 // It is idempotent: components shut down by an earlier call are skipped, and a
 // framework that has not been initialized has nothing to do. Panics in
 // Shutdown are recovered and returned as errors.
+//
+// Shutdown refuses while Run is in progress: cancel the Run context (or send
+// SIGINT/SIGTERM to RunWithSignals) so runners drain, then Shutdown runs as
+// part of that return path. Calling Shutdown from another goroutine while
+// runners are live would tear peers out from under them.
 func (f *CaerusFramework) Shutdown(ctx context.Context) error {
 	f.mu.Lock()
+	if f.running {
+		f.mu.Unlock()
+		return errors.New("caerus: cannot Shutdown while Run is in progress; cancel the Run context (SIGINT/SIGTERM for RunWithSignals)")
+	}
 	defer f.mu.Unlock()
 	return f.shutdownAllLocked(ctx)
 }
@@ -437,7 +467,9 @@ func Get[T CaerusComponent](f *CaerusFramework) (T, bool) {
 
 // MustGet returns the registered component of type T or panics if it is not
 // present. Prefer Get and handle the missing case explicitly; MustGet is a
-// convenience for wiring that is guaranteed to be present.
+// convenience for Init and tests where the peer is guaranteed to be present.
+// The framework recovers panics in Init, Run, and Shutdown only — do not call
+// MustGet from an arbitrary goroutine.
 func MustGet[T CaerusComponent](f *CaerusFramework) T {
 	typed, ok := Get[T](f)
 	if !ok {
@@ -565,6 +597,9 @@ func (f *CaerusFramework) absorbArgs() error {
 	}
 	f.mu.Unlock()
 	if conf == nil {
+		f.mu.Lock()
+		f.argsAbsorbed = true
+		f.mu.Unlock()
 		return nil
 	}
 

@@ -68,7 +68,8 @@ func (f *CaerusFramework) RunWithSignals(ctx context.Context, opts ...RunOption)
 	// Absorb argv (source registrars + flag overlay), then ask the configuration
 	// component whether any module's job flag was set (e.g.
 	// --postgresql.job=migrate). When a job is requested, only the core plus the
-	// named target(s) initialize — the serving components never start.
+	// named target(s) initialize — the serving components never start. Two job
+	// flags that name the same component are an error (one job per target).
 	if err := f.absorbArgs(); err != nil {
 		return err
 	}
