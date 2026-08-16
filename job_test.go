@@ -303,8 +303,8 @@ func TestRunJobDoesNotStartBootstrapRunnable(t *testing.T) {
 	if err := fw.Migrate(context.Background(), "db"); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if obsInit.Load() != 1 {
-		t.Fatal("bootstrap-stage component was not initialized on the job path")
+	if obsInit.Load() != 0 {
+		t.Fatal("observability must not Init on the job path unless a target depends on it")
 	}
 	if obsRun.Load() != 0 {
 		t.Fatal("bootstrap-stage Runnable started on the job path; jobs must not call Run")

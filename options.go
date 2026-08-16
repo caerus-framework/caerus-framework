@@ -24,17 +24,24 @@ type LogsSettings struct {
 // ObservabilitySettings are the initial observability defaults seeded by
 // cf.New before the observability configuration source loads. Nil pointer
 // fields keep the observability component's own construction defaults (health
-// checks on, metrics on, tracing off, address ":9090", service name "caerus").
+// checks on, metrics on, tracing off, bind ":9090", service name "caerus").
 type ObservabilitySettings struct {
-	// Address overrides the HTTP bind address (default ":9090"). The
-	// observability component binds this address in Run, not Init.
-	Address string
+	// Bind is a single host:port seed for the operator HTTP server
+	// (default ":9090"). Multi-bind lives in the observability config file
+	// (`bind` string or array). Bound in Run, not Init.
+	Bind string
 	// HealthChecks overrides the health-endpoints default (enabled).
 	HealthChecks *bool
 	// Metrics overrides the /metrics endpoint default (enabled).
 	Metrics *bool
 	// Tracing overrides the tracing default (disabled).
 	Tracing *bool
+	// TraceEndpoint seeds the OTLP/gRPC collector address.
+	TraceEndpoint string
+	// TraceInsecure, when true, admits cleartext OTLP. Default false (TLS).
+	TraceInsecure bool
+	// TraceSampleRatio seeds head sampling (0–1). Nil keeps 1.0.
+	TraceSampleRatio *float64
 	// ServiceName overrides the OpenTelemetry service.name default ("caerus").
 	ServiceName string
 	// ConfigSource is the name of the Source[ObservabilityConfig] registered

@@ -174,10 +174,11 @@ serve:
    `"migrate"`).
 3. Shuts down and returns. **No `Runnable` is started.**
 
-That is why listeners must bind in `Run`. Observability still *initializes*
-on a migrate Job (it is a bootstrap stage) but does not open `:9090`. The
-same is true of `caerus-framework-http` (app stage: usually not even in the
-migrate closure; even if it were, it would not listen).
+That is why listeners must bind in `Run`. Observability is **not**
+always initialized on a migrate Job (`isCoreStage` is logs +
+configuration). It still does not open `:9090` because jobs never start
+`Runnable`s. `caerus-framework-http` is app-stage: usually not in the
+migrate closure; even if it were, it would not listen.
 
 **One job per target per process.** Two flags (or two `JobRequest`s) that
 name the same component `Name()` are a hard error before any data Init —
