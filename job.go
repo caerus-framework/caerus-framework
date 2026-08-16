@@ -183,9 +183,9 @@ func (f *CaerusFramework) runJobs(ctx context.Context, reqs []JobRequest, cfg ru
 // it depends on, directly or transitively). An app-level target pulls in the
 // whole data plane beneath it; a data-level target like postgres pulls in only
 // the core components it needs — so a migrate job still runs when valkey is
-// down. Core (bootstrap-stage) components are always initialized regardless
-// (see isCoreStage). Those components must not bind listeners in Init: this
-// path never starts Runnables.
+// down. Logs and configuration (isCoreStage) are always initialized.
+// Observability is not, unless a target depends on it. Those components must
+// not bind listeners in Init: this path never starts Runnables.
 func (f *CaerusFramework) jobClosure(targets []CaerusComponent) map[CaerusComponent]bool {
 	keep := make(map[CaerusComponent]bool)
 	for _, t := range targets {
@@ -250,11 +250,12 @@ func (f *CaerusFramework) initializeSubset(ctx context.Context, keep func(Caerus
 }
 
 // isCoreStage reports whether a component belongs to a framework-owned
-// bootstrap stage (logs, configuration, observability, secrets). Core
-// components are always initialized, including on the job-only init path.
+// bootstrap stage that every job must Init (logs, configuration, secrets).
+// Observability is not in this set: jobs Init it only when a target lists
+// it in GetDependencies. Those components must not bind listeners in Init.
 func isCoreStage(s Stage) bool {
 	switch s {
-	case LogsStage, ConfigurationStage, ObservabilityStage, SecretsStage:
+	case LogsStage, ConfigurationStage, SecretsStage:
 		return true
 	}
 	return false
