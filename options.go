@@ -15,6 +15,14 @@ type LogsSettings struct {
 	Format string
 	// Level is "debug", "info", "warn" or "error" ("" keeps the logs default).
 	Level string
+	// ReportCaller seeds caller reporting. Nil keeps the logs default (off);
+	// explicit true/false overrides (same *bool semantics as LogConfig).
+	ReportCaller *bool
+	// StackTraces seeds stack tracebacks. Nil keeps the logs default (off).
+	StackTraces *bool
+	// StackLevel is "debug", "info", "warn" or "error" ("" keeps default error).
+	// Only meaningful when stack traces are enabled.
+	StackLevel string
 	// ConfigSource is the name of the Source[LogConfig] registered for this
 	// component; "" disables config-driven reloads. Must match the source's
 	// Name and the Owner must be cf_logs.ComponentName.
