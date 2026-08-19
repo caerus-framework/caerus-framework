@@ -136,6 +136,14 @@ type ConfigSourceValue struct {
 	// after argv absorption and routes it before serving. CLI-only: the value
 	// lives in the parsed flag, never in the config file or environment.
 	Job JobSpec
+	// AfterLoad runs after file+env+flag overlay and before Validate. It receives
+	// a pointer to Sample's concrete type as any (for example *cf_logs.LogConfig)
+	// and may type-assert it. Nil skips the step.
+	AfterLoad func(any) error
+	// Validate runs after every successful load (initial and reload). It
+	// receives a pointer to Sample's concrete type as any and may type-assert it.
+	// Nil skips validation.
+	Validate func(any) error
 	// Sample is a value of the concrete config type (e.g. cf_logs.LogConfig{}).
 	Sample any
 }
