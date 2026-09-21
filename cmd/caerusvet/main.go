@@ -11,9 +11,12 @@
 //
 //	go vet -vettool=$(go tool -n caerusvet) ./...
 //
-// caerusvet prefers false negatives over false positives: names that cannot
-// be resolved statically are skipped. Runtime Validate remains authoritative
-// for the assembled graph (unknown names, missing registration, cycles).
+// caerusvet prefers false negatives over false positives for names that
+// cannot be resolved statically (os.Getenv, maps, types without
+// ComponentName). WithName aliases (c.peerName(), c.valkeyName) are
+// resolved and must appear in GetDependencies. Runtime Validate remains
+// authoritative for the assembled graph (unknown names, missing
+// registration, cycles).
 package main
 
 import (

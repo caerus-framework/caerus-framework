@@ -34,11 +34,17 @@ type CaerusFramework struct {
 // in first-seen order). Start the application with Run or RunWithSignals.
 //
 // With no arguments the core components are not registered: the caller must
-// AddComponent them (or run a bare framework). Pass a FrameworkOptions to get
-// the app-as-component declaration: New auto-registers the always-on logs,
-// configuration and observability components (seeding them from the options)
+// AddComponent them (or run a bare framework). Pass one *FrameworkOptions to
+// get the app-as-component declaration: New auto-registers the always-on logs,
+// configuration and observability components (seeding them from the settings)
 // plus the declared Components slice.
+//
+// New accepts at most one options pointer. Extra arguments are a wiring
+// mistake and panic (they are not merged).
 func New(opts ...*FrameworkOptions) *CaerusFramework {
+	if len(opts) > 1 {
+		panic("caerus: New accepts at most one *FrameworkOptions")
+	}
 	f := &CaerusFramework{
 		byName: make(map[string]CaerusComponent),
 		stages: []Stage{LogsStage, ConfigurationStage, ObservabilityStage, SecretsStage},
@@ -58,14 +64,19 @@ func New(opts ...*FrameworkOptions) *CaerusFramework {
 // first time it is seen, after the bootstrap stages, in first-seen order —
 // components declare what they belong to, so there is no separate stage API.
 //
-// AddComponent is refused after Initialize, after a job has begun, or while
-// Run is in progress. Tests that need a different graph construct a new
-// framework.
+// AddComponent is refused after argv has been absorbed (AbsorbArgs /
+// Initialize / Run / jobs), after a job has begun, after Initialize, or while
+// Run is in progress. Registrars run once at absorb time, so a late add would
+// silently skip that module's config source. Tests that need a different graph
+// construct a new framework.
 func (f *CaerusFramework) AddComponent(c CaerusComponent) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.started || f.running || f.jobRan {
 		return errors.New("caerus: cannot AddComponent after the framework has started; construct a new framework")
+	}
+	if f.argsAbsorbed {
+		return errors.New("caerus: cannot AddComponent after AbsorbArgs / Initialize; register components before absorbing argv (construct a new framework)")
 	}
 	return f.addComponentTreeLocked(c)
 }
@@ -373,8 +384,9 @@ func (f *CaerusFramework) Shutdown(ctx context.Context) error {
 		f.mu.Unlock()
 		return errors.New("caerus: cannot Shutdown while Run is in progress; cancel the Run context (SIGINT/SIGTERM for RunWithSignals)")
 	}
-	defer f.mu.Unlock()
-	return f.shutdownAllLocked(ctx)
+	toStop := f.takeInitializedLocked()
+	f.mu.Unlock()
+	return f.shutdownSnapshot(ctx, toStop)
 }
 
 func (f *CaerusFramework) ensureInitialized(ctx context.Context) error {
@@ -389,20 +401,31 @@ func (f *CaerusFramework) ensureInitialized(ctx context.Context) error {
 
 func (f *CaerusFramework) shutdownAll(ctx context.Context) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.shutdownAllLocked(ctx)
+	toStop := f.takeInitializedLocked()
+	f.mu.Unlock()
+	return f.shutdownSnapshot(ctx, toStop)
 }
 
-func (f *CaerusFramework) shutdownAllLocked(ctx context.Context) error {
+// takeInitializedLocked claims the initialized slice so a concurrent Shutdown
+// is a no-op. Callers must hold f.mu. Component Shutdown runs without f.mu so
+// Get / GetByName / Components cannot deadlock.
+func (f *CaerusFramework) takeInitializedLocked() []CaerusComponent {
+	toStop := f.initialized
+	f.initialized = nil
+	return toStop
+}
+
+func (f *CaerusFramework) shutdownSnapshot(ctx context.Context, toStop []CaerusComponent) error {
 	var firstErr error
-	for i := len(f.initialized) - 1; i >= 0; i-- {
-		c := f.initialized[i]
+	for i := len(toStop) - 1; i >= 0; i-- {
+		c := toStop[i]
 		if err := safeShutdown(c, ctx); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("caerus: component %q failed to shut down: %w", c.Name(), err)
 		}
 	}
-	f.initialized = nil
+	f.mu.Lock()
 	f.started = false
+	f.mu.Unlock()
 	return firstErr
 }
 

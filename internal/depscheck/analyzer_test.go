@@ -29,6 +29,11 @@ func TestDepscheck(t *testing.T) {
 		"depscheck/helper",
 		"depscheck/helpermiss",
 		"depscheck/dynamic",
+		"depscheck/aliasok",
+		"depscheck/aliasmiss",
+		"depscheck/aliasfieldok",
+		"depscheck/aliasfieldmiss",
+		"depscheck/aliasmix",
 	)
 }
 

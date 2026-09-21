@@ -15,7 +15,11 @@ reserved slot with no component in it today; credentials are mounted
 files plus `ConfigReloader` (see [ARCHITECTURE.md](ARCHITECTURE.md)).
 There is no explicit stage API. Components are then registered with
 `AddComponent` before the framework starts. Duplicate names, nil
-components, and empty stages are rejected:
+components, and empty stages are rejected. **Register every component
+before absorbing argv.** `AbsorbArgs` (and `Initialize` / `Run` / jobs,
+which absorb first) run `ConfigSourceRegistrar`s once; a late
+`AddComponent` after that is refused so the new module cannot silently
+skip its config source, `--<name>` path flag, and job flag.
 
 ```go
 fw := caerusframework.New()
@@ -225,7 +229,8 @@ postgres/valkey/HTTP out from under live `Runnable`s.
 | Init failure | Already-initialized components are shut down in reverse order; error returned |
 | Runner failure | Framework context canceled; full shutdown; error returned |
 | Clean cancel | `Run` returns `nil` |
-| Shutdown | Reverse init order; idempotent; **refused while Run is in progress** |
+| Shutdown | Reverse init order; idempotent; **refused while Run is in progress**; component `Shutdown` does not hold the framework mutex (`Get` is safe) |
+| AddComponent after absorb | Refused — registrars already ran; construct a new framework |
 | Jobs skip Runnables | Listeners that bind in `Run` stay closed during migrate/seed |
 | One job per target | Two flags naming the same component `Name()` fail before Init |
 | One entrypoint per process | After a job, Initialize / Run / a second job on this instance fail |

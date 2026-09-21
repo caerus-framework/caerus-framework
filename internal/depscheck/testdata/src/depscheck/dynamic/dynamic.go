@@ -4,6 +4,7 @@ package dynamic
 
 import (
 	"context"
+	"os"
 
 	cf "github.com/caerus-framework/caerus-framework"
 )
@@ -29,8 +30,9 @@ func (a *App) GetDependencies() []string {
 }
 
 func (a *App) Init(ctx context.Context, fw *cf.CaerusFramework) error {
-	_, _ = cf.Get[*Unknown](fw)                 // no ComponentName const in package — skipped
-	_, _ = cf.GetByName[*Unknown](fw, a.peer()) // dynamic name — skipped
+	_, _ = cf.Get[*Unknown](fw)                       // no ComponentName const in package — skipped
+	_, _ = cf.GetByName[*Unknown](fw, a.peer())       // same method as GetDependencies — covered
+	_, _ = cf.GetByName[*Unknown](fw, os.Getenv("PEER")) // true dynamic — skipped
 	return nil
 }
 

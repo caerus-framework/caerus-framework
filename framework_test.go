@@ -848,6 +848,100 @@ func TestAddComponentAutoRegistersStage(t *testing.T) {
 	}
 }
 
+func TestShutdownAllowsGetFromComponentShutdown(t *testing.T) {
+	fw := newTestFW()
+	mustAdd(t, fw, newFake("peer", testDataStage))
+	shutter := newFake("shutter", testBusinessStage, "peer")
+	shutter.shut = func(ctx context.Context) error {
+		if _, ok := GetByName[*fake](fw, "peer"); !ok {
+			return errors.New("GetByName from component Shutdown failed")
+		}
+		return nil
+	}
+	mustAdd(t, fw, shutter)
+	if err := fw.Initialize(context.Background()); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	if err := fw.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+}
+
+func TestShutdownAllowsConcurrentGet(t *testing.T) {
+	fw := newTestFW()
+	peer := newFake("peer", testDataStage)
+	inShutdown := make(chan struct{})
+	unblock := make(chan struct{})
+	peer.shut = func(ctx context.Context) error {
+		close(inShutdown)
+		<-unblock
+		return nil
+	}
+	mustAdd(t, fw, peer)
+	if err := fw.Initialize(context.Background()); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- fw.Shutdown(context.Background()) }()
+
+	select {
+	case <-inShutdown:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown did not enter component Shutdown")
+	}
+
+	got := make(chan bool, 1)
+	go func() {
+		_, ok := GetByName[*fake](fw, "peer")
+		got <- ok
+	}()
+	select {
+	case ok := <-got:
+		if !ok {
+			t.Fatal("GetByName during Shutdown returned false")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("GetByName deadlocked during Shutdown")
+	}
+
+	close(unblock)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Shutdown: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown did not finish")
+	}
+}
+
+func TestAddComponentRefusedAfterAbsorbArgs(t *testing.T) {
+	fw := newTestFW()
+	mustAdd(t, fw, newFake("a", testDataStage))
+	if err := fw.AbsorbArgs(); err != nil {
+		t.Fatalf("AbsorbArgs: %v", err)
+	}
+	err := fw.AddComponent(newFake("late", testDataStage))
+	if err == nil || !strings.Contains(err.Error(), "cannot AddComponent after AbsorbArgs") {
+		t.Fatalf("expected refuse after AbsorbArgs, got %v", err)
+	}
+}
+
+func TestNewRejectsMultipleOptions(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected New with two options to panic")
+		}
+		msg, _ := r.(string)
+		if !strings.Contains(msg, "at most one") {
+			t.Fatalf("panic = %v, want at most one", r)
+		}
+	}()
+	_ = New(&FrameworkOptions{}, &FrameworkOptions{})
+}
+
 // atomicBool is a tiny helper for tests.
 type atomicBool struct {
 	mu sync.Mutex

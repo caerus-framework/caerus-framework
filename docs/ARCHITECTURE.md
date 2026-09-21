@@ -202,10 +202,11 @@ at the earliest safe point:
 A `go vet`-style checker — **`caerusvet`** (`go tool caerusvet ./...` from the
 core module or any dependent whose go.mod declares the `tool` directive) —
 additionally catches Init peer lookups that are missing from
-`GetDependencies` (literals / known `ComponentName` consts). It deliberately
-prefers false negatives over false positives and does not replace runtime
-`Validate` for the assembled graph. The analyzer lives at
-[`cmd/caerusvet`](../cmd/caerusvet).
+`GetDependencies`: string constants, `ComponentName` selectors, and
+WithName alias slots (`c.peerName()`, `c.valkeyName`, locals assigned from
+those). True dynamics (`os.Getenv`, maps) are skipped on purpose. It does
+not replace runtime `Validate` for the assembled graph. The analyzer lives
+at [`cmd/caerusvet`](../cmd/caerusvet).
 
 ## Error policy
 
