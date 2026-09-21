@@ -45,13 +45,18 @@ func (f *CaerusFramework) RunJob(ctx context.Context, target, task string) error
 // configuration component) has no jobs.
 func (f *CaerusFramework) jobRequests() ([]JobRequest, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	var js JobSource
 	for _, c := range f.components {
-		if js, ok := c.(JobSource); ok {
-			return js.JobRequests()
+		if src, ok := c.(JobSource); ok {
+			js = src
+			break
 		}
 	}
-	return nil, nil
+	f.mu.Unlock()
+	if js == nil {
+		return nil, nil
+	}
+	return js.JobRequests()
 }
 
 // runJobs runs the job-only init path for the requested jobs: it resolves each

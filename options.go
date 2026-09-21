@@ -8,8 +8,9 @@ import (
 // LogsSettings are the initial log defaults seeded by cf.New before the logs
 // configuration source loads. Empty fields keep the logs component's own
 // construction defaults (text format, Info level). Seeding does not replace the
-// configuration component as the options plane: the source, once available,
-// notifies the logs component and its values win.
+// configuration component: the source, once available, notifies the logs
+// component and its values win. These are file/env-shaped **settings**, not
+// construct-time **options**.
 type LogsSettings struct {
 	// Format is "text" or "json" ("" keeps the logs default).
 	Format string
@@ -65,10 +66,9 @@ type ObservabilitySettings struct {
 // the live values for everything else.
 //
 // The core components are always registered, in bootstrap order, whether or
-// not they appear in Options; the Logs / Observability fields only seed the
-// initial defaults before their configuration sources load (defaults until
-// notify). They do not replace the configuration component as the options
-// plane.
+// not they appear in Components; the Logs / Observability fields only seed the
+// initial **settings** before their configuration sources load (defaults until
+// notify). They do not replace the configuration component.
 type FrameworkOptions struct {
 	// Logs seeds the logs component. Nil keeps its construction defaults.
 	Logs *LogsSettings
@@ -178,4 +178,23 @@ func buildOrPanic(name string, build func() (CaerusComponent, error)) CaerusComp
 		panic(fmt.Sprintf("caerus: build %s component: %v", name, err))
 	}
 	return c
+}
+
+// swapCoreFactoriesForTest replaces the registered core factories and returns
+// a restore function. Tests use it so New(&FrameworkOptions{}) can run without
+// linking sibling modules.
+func swapCoreFactoriesForTest(
+	logs func(*LogsSettings) (CaerusComponent, error),
+	configuration func() (CaerusComponent, error),
+	observability func(*ObservabilitySettings) (CaerusComponent, error),
+) func() {
+	coreMu.Lock()
+	oldL, oldC, oldO := logsFactory, configurationFactory, observabilityFactory
+	logsFactory, configurationFactory, observabilityFactory = logs, configuration, observability
+	coreMu.Unlock()
+	return func() {
+		coreMu.Lock()
+		logsFactory, configurationFactory, observabilityFactory = oldL, oldC, oldO
+		coreMu.Unlock()
+	}
 }

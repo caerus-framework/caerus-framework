@@ -594,3 +594,23 @@ func TestAddComponentRefusedAfterJob(t *testing.T) {
 		t.Fatalf("expected AddComponent after job to fail, got %v", err)
 	}
 }
+
+func TestJobRequestsAllowsGet(t *testing.T) {
+	fw := newTestFW()
+	conf := &fakeConf{fake: newFake("configuration", ConfigurationStage)}
+	var called bool
+	conf.jobs = func() ([]JobRequest, error) {
+		called = true
+		if _, ok := GetByName[*fakeConf](fw, "configuration"); !ok {
+			t.Error("GetByName during JobRequests failed")
+		}
+		return nil, nil
+	}
+	mustAdd(t, fw, conf)
+	if _, err := fw.jobRequests(); err != nil {
+		t.Fatalf("jobRequests: %v", err)
+	}
+	if !called {
+		t.Fatal("JobRequests was not called")
+	}
+}

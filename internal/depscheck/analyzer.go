@@ -9,11 +9,12 @@
 // up a peer the component forgot to declare. This analyzer is the static,
 // build-time complement.
 //
-// Analysis is deliberately conservative: names that cannot be resolved to a
-// string constant (dynamic GetByName names, types without a ComponentName
-// const, GetDependencies built from runtime values) are skipped rather than
-// reported, preferring false negatives over false positives. Runtime Validate
-// remains authoritative for the live registry.
+// Analysis is conservative on true dynamics (os.Getenv, maps, parameters)
+// and types without a ComponentName const: those lookups are skipped rather
+// than reported. WithName aliases are not skipped: c.peerName() / c.valkeyName
+// in Init must appear as the same field, the same method, or the constants
+// that method can return in GetDependencies. Runtime Validate remains
+// authoritative for the live registry.
 package depscheck
 
 import (
@@ -53,17 +54,19 @@ func init() {
 
 // depsResult is the result of statically evaluating a GetDependencies body.
 type depsResult struct {
-	names    []string        // resolved peer names, in declaration order
+	names    []string        // resolved constant peer names, in declaration order
+	refs     []nameRef       // every matchable slot (const, field, method)
 	literals map[string]bool // subset of names that came from plain string literals
-	complete bool            // true when every element resolved to a constant
+	complete bool            // true when every element resolved to a slot or constant
 }
 
 // lookup is a single Init-time peer lookup statically resolved from the code.
 type lookup struct {
 	pos      token.Pos
 	fn       string // Get, MustGet, GetByName or MustGetByName
-	name     string // resolved peer name
-	resolved bool   // name resolved to a string constant
+	name     string // resolved peer name when the slot is a constant
+	resolved bool   // name resolved to a string constant (legacy; prefer ref)
+	ref      nameRef
 	typeName string // resolved Go type argument name (e.g. CFPostgres)
 	typePkg  string // package name of the type argument (e.g. cf_postgres)
 }
@@ -176,6 +179,7 @@ func isFrameworkType(t types.Type) bool {
 // componentInfo bundles the analysis state for one component type.
 type componentInfo struct {
 	info     *pkgInfo
+	named    *types.Named
 	typeName string // Go type name, e.g. "API"
 	initDecl *ast.FuncDecl
 	depsDecl *ast.FuncDecl // GetDependencies, nil when not implemented
@@ -186,17 +190,18 @@ type componentInfo struct {
 func (p *pkgInfo) newComponent(named *types.Named, initFn *types.Func) *componentInfo {
 	c := &componentInfo{
 		info:     p,
+		named:    named,
 		typeName: named.Obj().Name(),
 		initDecl: p.funcsByObj[initFn],
 	}
 	if d := p.dependenciesMethod(named); d != nil {
 		c.depsDecl = p.funcsByObj[d]
 		if c.depsDecl != nil {
-			c.deps = p.resolveDependencies(c.depsDecl)
+			c.deps = p.resolveDependencies(c.depsDecl, named)
 		}
 	}
 	if c.initDecl != nil {
-		c.lookups = p.collectLookups(initFn)
+		c.lookups = p.collectLookups(initFn, named)
 	}
 	return c
 }
@@ -215,25 +220,38 @@ func (p *pkgInfo) dependenciesMethod(named *types.Named) *types.Func {
 }
 
 // resolveDependencies evaluates a GetDependencies body into the set of declared
-// peer names. Literals and string-constant selectors (e.g. cf_logs.ComponentName)
-// resolve; anything built from runtime values marks the result incomplete so
-// the caller skips missing-dep reports (false-negative-first).
-func (p *pkgInfo) resolveDependencies(fd *ast.FuncDecl) depsResult {
+// peer names. Literals, string-constant selectors (e.g. cf_logs.ComponentName),
+// alias fields (c.valkeyName) and zero-arg methods (c.peerName()) resolve.
+// Anything built from true runtime values (os.Getenv, maps) marks the result
+// incomplete so const lookups that might hide in that remainder are skipped.
+func (p *pkgInfo) resolveDependencies(fd *ast.FuncDecl, recv *types.Named) depsResult {
 	res := depsResult{complete: true, literals: map[string]bool{}}
 	seen := map[string]bool{}
-	add := func(name string, ok bool) {
+	var add func(nameRef, bool)
+	add = func(ref nameRef, ok bool) {
 		if !ok {
 			res.complete = false
 			return
 		}
-		if !seen[name] {
-			seen[name] = true
-			res.names = append(res.names, name)
+		if ref.kind == nameUnion {
+			if !ref.expand {
+				res.complete = false
+			}
+			for _, a := range ref.alts {
+				add(a, true)
+			}
+			return
+		}
+		res.refs = append(res.refs, ref)
+		if ref.kind == nameConst && !seen[ref.value] {
+			seen[ref.value] = true
+			res.names = append(res.names, ref.value)
 		}
 	}
+	walking := map[types.Object]bool{}
 	for _, r := range returns(fd.Body) {
 		for _, result := range r.Results {
-			p.collectSliceExpr(result, fd.Body, res.literals, add)
+			p.collectSliceExpr(result, fd.Body, recv, walking, res.literals, add)
 		}
 	}
 	return res
@@ -255,7 +273,7 @@ func returns(body *ast.BlockStmt) []*ast.ReturnStmt {
 // expression may be a composite literal, an append chain, a local variable
 // accumulated with append, or nil. Elements resolved from plain string
 // literals are recorded in literals for the stale-dep check.
-func (p *pkgInfo) collectSliceExpr(expr ast.Expr, body *ast.BlockStmt, literals map[string]bool, add func(string, bool)) {
+func (p *pkgInfo) collectSliceExpr(expr ast.Expr, body *ast.BlockStmt, recv *types.Named, walking map[types.Object]bool, literals map[string]bool, add func(nameRef, bool)) {
 	switch e := expr.(type) {
 	case *ast.CompositeLit:
 		for _, el := range e.Elts {
@@ -263,56 +281,71 @@ func (p *pkgInfo) collectSliceExpr(expr ast.Expr, body *ast.BlockStmt, literals 
 			if kv, ok := el.(*ast.KeyValueExpr); ok {
 				val = kv.Value
 			}
-			if name, ok := p.resolveStringExpr(val); ok {
-				if isStringLit(val) {
-					literals[name] = true
-				}
-				add(name, true)
-			} else {
-				add("", false)
-			}
+			p.addNameExpr(val, body, recv, literals, add)
 		}
 	case *ast.CallExpr:
 		if id, ok := e.Fun.(*ast.Ident); ok && id.Name == "append" && len(e.Args) > 0 {
-			if lit, ok := e.Args[0].(*ast.CompositeLit); ok {
-				p.collectSliceExpr(lit, body, literals, add)
-			}
-			for _, arg := range e.Args[1:] {
-				if lit, ok := arg.(*ast.CompositeLit); ok {
-					p.collectSliceExpr(lit, body, literals, add)
+			p.collectSliceExpr(e.Args[0], body, recv, walking, literals, add)
+			n := len(e.Args)
+			for i := 1; i < n; i++ {
+				arg := e.Args[i]
+				if spreadLast(e) && i == n-1 {
+					if sid, ok := arg.(*ast.Ident); ok {
+						p.collectVarSlice(sid, body, recv, walking, literals, add)
+						continue
+					}
+					p.collectSliceExpr(arg, body, recv, walking, literals, add)
 					continue
 				}
-				if name, ok := p.resolveStringExpr(arg); ok {
-					if isStringLit(arg) {
-						literals[name] = true
-					}
-					add(name, true)
-				} else {
-					add("", false)
+				if lit, ok := arg.(*ast.CompositeLit); ok {
+					p.collectSliceExpr(lit, body, recv, walking, literals, add)
+					continue
 				}
+				p.addNameExpr(arg, body, recv, literals, add)
 			}
 			return
 		}
-		add("", false)
+		add(nameRef{}, false)
 	case *ast.Ident:
 		if e.Name == "nil" {
 			return // explicit "no dependencies" — complete
 		}
-		p.collectVarSlice(e, body, literals, add)
+		if p.isStringSlice(e) {
+			p.collectVarSlice(e, body, recv, walking, literals, add)
+			return
+		}
+		p.addNameExpr(e, body, recv, literals, add)
 	default:
-		add("", false)
+		p.addNameExpr(e, body, recv, literals, add)
 	}
+}
+
+func (p *pkgInfo) addNameExpr(expr ast.Expr, body *ast.BlockStmt, recv *types.Named, literals map[string]bool, add func(nameRef, bool)) {
+	ref, ok := p.resolveNameRef(expr, recv, body, 0)
+	if !ok {
+		add(nameRef{}, false)
+		return
+	}
+	if ref.kind == nameConst && isStringLit(expr) {
+		literals[ref.value] = true
+	}
+	add(ref, true)
 }
 
 // collectVarSlice traces a local []string variable: its base assignment plus
 // every append accumulation in body, feeding the results to add.
-func (p *pkgInfo) collectVarSlice(id *ast.Ident, body *ast.BlockStmt, literals map[string]bool, add func(string, bool)) {
+func (p *pkgInfo) collectVarSlice(id *ast.Ident, body *ast.BlockStmt, recv *types.Named, walking map[types.Object]bool, literals map[string]bool, add func(nameRef, bool)) {
 	obj := p.objectOfIdent(id)
 	v, ok := obj.(*types.Var)
 	if !ok || v.IsField() || v.Parent() == nil {
-		add("", false)
+		add(nameRef{}, false)
 		return
 	}
+	if walking[obj] {
+		return
+	}
+	walking[obj] = true
+	defer delete(walking, obj)
 	found := false
 	ast.Inspect(body, func(n ast.Node) bool {
 		as, ok := n.(*ast.AssignStmt)
@@ -326,14 +359,14 @@ func (p *pkgInfo) collectVarSlice(id *ast.Ident, body *ast.BlockStmt, literals m
 			}
 			found = true
 			if i < len(as.Rhs) {
-				p.collectSliceExpr(as.Rhs[i], body, literals, add)
+				p.collectSliceExpr(as.Rhs[i], body, recv, walking, literals, add)
 			}
 			break
 		}
 		return true
 	})
 	if !found {
-		add("", false)
+		add(nameRef{}, false)
 	}
 }
 
@@ -367,14 +400,14 @@ func isStringLit(expr ast.Expr) bool {
 // collectLookups walks Init and every same-package helper it calls (bounded by
 // maxHelperDepth) collecting cf.Get / cf.MustGet / cf.GetByName /
 // cf.MustGetByName peer lookups.
-func (p *pkgInfo) collectLookups(initFn *types.Func) []lookup {
+func (p *pkgInfo) collectLookups(initFn *types.Func, recv *types.Named) []lookup {
 	var out []lookup
 	visited := map[*types.Func]bool{}
-	p.walkFunc(initFn, 0, visited, &out)
+	p.walkFunc(initFn, 0, visited, &out, recv)
 	return out
 }
 
-func (p *pkgInfo) walkFunc(fn *types.Func, depth int, visited map[*types.Func]bool, out *[]lookup) {
+func (p *pkgInfo) walkFunc(fn *types.Func, depth int, visited map[*types.Func]bool, out *[]lookup, recv *types.Named) {
 	if depth > maxHelperDepth || visited[fn] {
 		return
 	}
@@ -388,12 +421,12 @@ func (p *pkgInfo) walkFunc(fn *types.Func, depth int, visited map[*types.Func]bo
 		if !ok {
 			return true
 		}
-		if lu := p.lookupFromCall(call); lu != nil {
+		if lu := p.lookupFromCall(call, recv, fd.Body); lu != nil {
 			*out = append(*out, *lu)
 			return false // the call itself resolved; do not descend into it
 		}
 		if callee := p.samePkgCallee(call); callee != nil {
-			p.walkFunc(callee, depth+1, visited, out)
+			p.walkFunc(callee, depth+1, visited, out, recv)
 		}
 		return true
 	})
@@ -428,7 +461,7 @@ func (p *pkgInfo) samePkgCallee(call *ast.CallExpr) *types.Func {
 
 // lookupFromCall resolves a call to a framework peer lookup, or nil when the
 // call is not one (or its name cannot be statically resolved).
-func (p *pkgInfo) lookupFromCall(call *ast.CallExpr) *lookup {
+func (p *pkgInfo) lookupFromCall(call *ast.CallExpr, recv *types.Named, body *ast.BlockStmt) *lookup {
 	var obj types.Object
 	switch fun := call.Fun.(type) {
 	case *ast.IndexExpr: // cf.Get[*T](...)
@@ -450,7 +483,7 @@ func (p *pkgInfo) lookupFromCall(call *ast.CallExpr) *lookup {
 	case "Get", "MustGet":
 		return p.getLookup(call, fn.Name())
 	case "GetByName", "MustGetByName":
-		return p.getByNameLookup(call, fn.Name())
+		return p.getByNameLookup(call, fn.Name(), recv, body)
 	default:
 		return nil
 	}
@@ -479,6 +512,7 @@ func (p *pkgInfo) getLookup(call *ast.CallExpr, fnName string) *lookup {
 	}
 	if name, ok := p.componentNameFor(named); ok {
 		lu.name, lu.resolved = name, true
+		lu.ref = nameRef{kind: nameConst, value: name}
 	}
 	return lu
 }
@@ -486,15 +520,18 @@ func (p *pkgInfo) getLookup(call *ast.CallExpr, fnName string) *lookup {
 // getByNameLookup resolves cf.GetByName[*U](fw, "name") /
 // cf.MustGetByName[*U](fw, "name"). Only constant name arguments resolve; the
 // type argument is best-effort.
-func (p *pkgInfo) getByNameLookup(call *ast.CallExpr, fnName string) *lookup {
+func (p *pkgInfo) getByNameLookup(call *ast.CallExpr, fnName string, recv *types.Named, body *ast.BlockStmt) *lookup {
 	if len(call.Args) < 2 {
 		return nil
 	}
-	name, ok := p.resolveStringExpr(call.Args[1])
+	ref, ok := p.resolveNameRef(call.Args[1], recv, body, 0)
 	if !ok {
-		return nil // dynamic name — cannot resolve, skip
+		return nil // true dynamic name — cannot resolve, skip
 	}
-	lu := &lookup{pos: call.Pos(), fn: fnName, name: name, resolved: true}
+	lu := &lookup{pos: call.Pos(), fn: fnName, ref: ref}
+	if ref.kind == nameConst {
+		lu.name, lu.resolved = ref.value, true
+	}
 	if idx, ok := call.Fun.(*ast.IndexExpr); ok {
 		if t := p.pass.TypesInfo.TypeOf(idx.Index); t != nil {
 			if ptr, ok := t.(*types.Pointer); ok {
@@ -543,24 +580,25 @@ func (p *pkgInfo) checkComponent(c *componentInfo, checkStaleDeps bool) {
 		return
 	}
 
-	declared := map[string]bool{}
-	for _, n := range c.deps.names {
-		declared[n] = true
-	}
+	bag := flattenBag(c.deps.refs)
 
 	for _, lu := range c.lookups {
-		if !lu.resolved {
+		if !lu.ref.ok() {
 			continue
 		}
-		if declared[lu.name] {
+		if bag.covers(lu.ref) {
 			continue
 		}
-		if !c.deps.complete {
-			continue // GetDependencies has dynamic elements; do not guess
+		// A leftover dynamic element in GetDependencies might still list a
+		// constant name we cannot see; skip const-only misses in that case.
+		// Alias slots (field / method) are never hidden inside getenv, so
+		// those still report.
+		if lu.ref.kind == nameConst && !c.deps.complete {
+			continue
 		}
 		p.pass.Report(analysis.Diagnostic{
 			Pos:     lu.pos,
-			Message: fmt.Sprintf("Init looks up %q (%s) but GetDependencies omits it", lu.name, p.lookupDesc(lu)),
+			Message: fmt.Sprintf("Init looks up %s (%s) but GetDependencies omits it", lu.ref.label(), p.lookupDesc(lu)),
 		})
 	}
 
